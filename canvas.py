@@ -668,10 +668,15 @@ class CircuitScene(QGraphicsScene):
 
     def create_connection(self, a_item: BaseComponent, a_port: PortItem,
                           b_item: BaseComponent, b_port: PortItem):
-        # 只支持两个母线/线路元件之间的连接
-        if not isinstance(a_item, (BusItem, LineCompItem)) or \
-           not isinstance(b_item, (BusItem, LineCompItem)):
+        # Reject self-loops immediately
+        if a_item is b_item:
             return
+        # Gen / Load are bound to a bus at add-time (bus_uid on the model).
+        # User-drawn lines to / from them are visual hints — the topology
+        # mutation below only runs for real Bus <-> Bus, Bus <-> LineComp
+        # and LineComp <-> LineComp pairs. Everything else still gets a
+        # visible connection line for feedback, but the user's bus_uid
+        # binding stays as-is.
         # 母线对母线 → 线路
         if isinstance(a_item, BusItem) and isinstance(b_item, BusItem):
             uid = uuid.uuid4().hex[:8]
@@ -729,8 +734,19 @@ class CircuitScene(QGraphicsScene):
             # 反过来, 递归
             self.create_connection(b_item, b_port, a_item, a_port)
             return
+        elif isinstance(a_item, LineCompItem) and isinstance(b_item, LineCompItem):
+            # Trafo <-> Trafo, Trafo <-> Impedance, Impedance <-> Impedance
+            # are not standard power-system topologies. Draw the line so
+            # the user gets visual feedback, but skip the topology mutation.
+            conn = ConnectionItem(a_item, a_port, b_item, b_port)
+            conn.kind = "LineComp-Link"
+            conn.uid = ""
         else:
-            return
+            # Gen / Load: just draw a visual line. Topology is bound
+            # by the bus_uid recorded when the component was added.
+            conn = ConnectionItem(a_item, a_port, b_item, b_port)
+            conn.kind = "Visual"
+            conn.uid = ""
 
         self.addItem(conn)
         a_item.register_connection(conn)
