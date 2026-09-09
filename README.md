@@ -38,18 +38,31 @@ python app.py
 
 ## 打包成 exe
 
-```bash
-source .venv/bin/activate
-uv pip install pyinstaller
+### Windows (推荐)
+
+直接双击项目根目录的 `build_windows.bat`, 脚本会自动:
+1. 创建虚拟环境 `.venv`
+2. 装 PyQt5 / pandapower / pyinstaller
+3. 跑 pyinstaller 产出 `dist\PowerFlowStudio.exe`
+
+第一次打包 1-3 分钟, 之后增量打包 30 秒左右. 产物单文件 80-150MB.
+
+如果想自己手动跑:
+
+```cmd
+cd PowerFlowStudio
+py -m venv .venv
+.venv\Scripts\activate
+pip install PyQt5 pyqtgraph pandapower numpy pyinstaller
 pyinstaller --onefile --windowed --name PowerFlowStudio app.py
-# 产物: dist/PowerFlowStudio.exe (Windows) 或 dist/PowerFlowStudio (Linux/macOS)
+:: 产物: dist\PowerFlowStudio.exe
 ```
 
 注意:
 - 第一次打包比较慢(数十秒到几分钟)
 - 单文件 exe 体积 80-150MB(包含 pandapower + numpy + PyQt5)
-- Windows: 直接双击 dist\PowerFlowStudio.exe 运行
-- Linux: `./dist/PowerFlowStudio`; 若提示缺 libxcb 等, `sudo apt install libxcb-xinerama0 libxkbcommon-x11-0`
+- Windows: 直接双击 `dist\PowerFlowStudio.exe` 运行
+- Linux: `pyinstaller --onefile --windowed app.py`, 产物 `dist/PowerFlowStudio`(ELF); 运行需 `sudo apt install libxcb-xinerama0 libxkbcommon-x11-0`
 
 ## 文件结构
 
