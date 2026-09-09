@@ -18,7 +18,7 @@ from app import MainWindow, render_scene_png
 
 
 def main():
-    qapp = QApplication.instance() or QApplication([])
+    QApplication.instance() or QApplication([])   # 初始化 Qt 必需
     w = MainWindow()
     w.resize(1280, 800)
     w._load_two_end_demo()
