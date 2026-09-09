@@ -38,7 +38,14 @@ python app.py
 
 ## 打包成 exe
 
-### Windows (推荐)
+### 直接下载
+
+最新编译好的 Windows exe 在 [Releases 页面](https://github.com/704315792-crypto/PowerFlowStudio/releases/latest) 下载:
+[PowerFlowStudio.exe](https://github.com/704315792-crypto/PowerFlowStudio/releases/latest/download/PowerFlowStudio.exe)
+
+下载后双击即可运行, 无需安装 Python.
+
+### 从源码打包 (Windows)
 
 直接双击项目根目录的 `build_windows.bat`, 脚本会自动:
 1. 创建虚拟环境 `.venv`
