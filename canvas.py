@@ -468,10 +468,12 @@ class CircuitView(QGraphicsView):
 
     def mouseReleaseEvent(self, event):
         if self._pending_port and self._rubber_line:
-            # Find the item under the cursor, but make sure we hit an
-            # actual port — PortItem mouseMove events from dragging the
-            # cursor over the source port itself should not self-connect.
-            target = self.itemAt(event.pos())
+            # Find the item under the cursor. Ports are tiny (8x8),
+            # so the user often releases on the component body instead
+            # of the port dot itself. If we hit a BaseComponent, walk
+            # to its nearest port to the cursor; only ignore if we hit
+            # something unrelated (e.g. another rubber-line, empty area).
+            target = self._find_release_target(event.pos())
             if isinstance(target, PortItem) and target is not self._pending_port:
                 # Find the two components the ports belong to
                 a_item = self._pending_port.parentItem()
@@ -484,6 +486,41 @@ class CircuitView(QGraphicsView):
             event.accept()
             return
         super().mouseReleaseEvent(event)
+
+    def _find_release_target(self, view_pos):
+        """Resolve the item under the cursor at the moment of release.
+        If the user released on the component body (a BaseComponent) rather
+        than on a port dot, return the nearest PortItem on that component.
+        If they released on a label or some other child, walk up to the
+        owning component first.
+        """
+        scene_pt = self.mapToScene(view_pos)
+        item = self.itemAt(view_pos)
+        # Common case: user released on the port itself.
+        if isinstance(item, PortItem):
+            return item
+        # Walk up to the owning BaseComponent for non-port hits (label
+        # text, decoration rectangles, etc. all live as children).
+        comp = item
+        if comp is not None and not isinstance(comp, BaseComponent):
+            comp = comp.parentItem()
+        # Snap to the nearest port on that component.
+        if isinstance(comp, BaseComponent):
+            best_port = None
+            best_dist = None
+            for port_id, port in comp._ports.items():
+                port_scene = port.scenePos()
+                dx = port_scene.x() - scene_pt.x()
+                dy = port_scene.y() - scene_pt.y()
+                d2 = dx * dx + dy * dy
+                if best_dist is None or d2 < best_dist:
+                    best_dist = d2
+                    best_port = port
+            # Accept ports within 80 px of the cursor (covers port dots
+            # and the immediate area around them).
+            if best_port is not None and best_dist is not None and best_dist <= 80 * 80:
+                return best_port
+        return item
 
     def keyPressEvent(self, event):
         # Delete / Backspace deletes the selection
