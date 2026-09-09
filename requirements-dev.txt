@@ -1,4 +1,5 @@
 # 开发/测试/打包依赖, 安装: pip install -r requirements-dev.txt
 -r requirements.txt
 pytest==9.1.1
+pytest-cov==7.1.0
 pyinstaller==6.22.0

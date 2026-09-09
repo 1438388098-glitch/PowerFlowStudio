@@ -35,6 +35,8 @@ class GenUnit:
     x: float = 0.0                 # 相对母线的偏移
     y: float = 0.0
     is_slack: bool = False         # 勾选后该机作为平衡节点(默认仍取第一台)
+    gen_mode: str = "PV"           # "PV" 恒电压机端 / "PQ" 定功率(静默发电)
+    slack_weight: float = 1.0      # 分布式松弛分摊权重
     # ---- OPF 最优潮流 ----
     min_p_mw: float = 0.0          # OPF 出力下限
     max_p_mw: float = 100.0        # OPF 出力上限
@@ -245,9 +247,21 @@ def build_pandapower(net: Network, for_opf: bool = False) -> Tuple[pp.pandapower
         pnet.ext_grid.at[pp_id, "rx_max"] = first_gen.rx_max
         pnet.ext_grid.at[pp_id, "rx_min"] = first_gen.rx_min
         pnet.ext_grid.at[pp_id, "kappa"] = first_gen.kappa
+        pnet.ext_grid.at[pp_id, "slack_weight"] = first_gen.slack_weight
         id_maps["ext"][pp_id] = first_gen_uid
         for uid in ordered[1:]:
             g = net.gens[uid]
+            if g.gen_mode == "PQ" and not for_opf:
+                # PQ 机组: 定功率注入, 用 sgen 建模 (无电压控制)
+                pp_id = pp.create_sgen(
+                    pnet,
+                    bus=bus_id_map[g.bus_uid],
+                    p_mw=g.p_mw,
+                    q_mvar=0.0,
+                    name=g.name,
+                )
+                id_maps.setdefault("sgen", {})[pp_id] = uid
+                continue
             if for_opf:
                 pp_id = pp.create_gen(
                     pnet,
@@ -268,6 +282,7 @@ def build_pandapower(net: Network, for_opf: bool = False) -> Tuple[pp.pandapower
                     name=g.name,
                     controllable=False,
                 )
+            pnet.gen.at[pp_id, "slack_weight"] = g.slack_weight
             id_maps["gen"][pp_id] = uid
         if for_opf:
             # OPF 要求所有可调度元件都有成本函数(线性成本 cp1)
@@ -408,10 +423,12 @@ def _validate_topology(net: Network) -> str:
     return ""
 
 
-def run_power_flow(net: Network, algorithm: str = "nr") -> Tuple[bool, str]:
+def run_power_flow(net: Network, algorithm: str = "nr",
+                   distributed_slack: bool = False) -> Tuple[bool, str]:
     """
     跑潮流, 把结果写回 net.bus_voltage_pu 等字段
     algorithm: "nr" 牛顿-拉夫逊(默认) 或 "dc" 直流潮流(只算 P/相角, 电压全为 1.0)
+    distributed_slack: 按 gen/ext_grid 的 slack_weight 把松弛功率分摊到多机
     返回 (success, error_msg)
     """
     _clear_results(net)
@@ -427,6 +444,9 @@ def run_power_flow(net: Network, algorithm: str = "nr") -> Tuple[bool, str]:
             # pandapower 3.x: 直流潮流是独立入口 rundcpp,
             # runpp(algorithm="dc") 会 KeyError
             pp.rundcpp(pnet, numba=False)
+        elif distributed_slack:
+            pp.runpp(pnet, algorithm=algorithm, init="flat", numba=False,
+                     distributed_slack=True)
         else:
             pp.runpp(pnet, algorithm=algorithm, init="flat", numba=False)
     except pp.LoadflowNotConverged as e:
@@ -459,7 +479,7 @@ def _fail(net: Network, msg: str):
 # ============================================================
 
 def n_minus_1_check(net: Network, algorithm: str = "nr",
-                    loading_limit: float = 100.0) -> dict:
+                    loading_limit: float = 100.0, progress=None) -> dict:
     """
     N-1 校核: 开断每条线路/变压器后重跑潮流, 报告越限与孤立母线。
 
@@ -479,9 +499,12 @@ def n_minus_1_check(net: Network, algorithm: str = "nr",
 
     branches = [("线路", uid, net.lines) for uid in net.lines]
     branches += [("变压器", uid, net.trafos) for uid in net.trafos]
+    total = len(branches)
 
     report: Dict[str, dict] = {}
-    for kind, uid, container in branches:
+    for done, (kind, uid, container) in enumerate(branches):
+        if progress is not None:
+            progress(done, total)
         name = container[uid].name
         trial = _copy.deepcopy(net)
         (trial.lines if kind == "线路" else trial.trafos).pop(uid, None)
@@ -596,6 +619,10 @@ def _extract_ac_results(net: Network, pnet, id_maps):
         if pp_id in pnet.res_ext_grid.index:
             net.gen_p_mw[uid] = float(pnet.res_ext_grid.at[pp_id, "p_mw"])
             net.gen_q_mvar[uid] = float(pnet.res_ext_grid.at[pp_id, "q_mvar"])
+    for pp_id, uid in id_maps.get("sgen", {}).items():
+        if pp_id in pnet.res_sgen.index:
+            net.gen_p_mw[uid] = float(pnet.res_sgen.at[pp_id, "p_mw"])
+            net.gen_q_mvar[uid] = float(pnet.res_sgen.at[pp_id, "q_mvar"])
     for pp_id, uid in id_maps["load"].items():
         if pp_id in pnet.res_load.index:
             net.load_p_mw[uid] = float(pnet.res_load.at[pp_id, "p_mw"])

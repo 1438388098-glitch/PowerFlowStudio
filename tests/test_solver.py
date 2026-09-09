@@ -494,3 +494,48 @@ class TestShortCircuit:
         run_short_circuit(net)
         assert not net.line_p_from_mw, "短路计算应清空潮流结果(互斥显示)"
         assert net.bus_ikss_ka
+
+
+class TestPQMode:
+    def test_pq_gen_fixed_power_no_voltage_control(self):
+        """PQ 机组: 定功率注入, Q=0, 不调电压"""
+        net = build_5bus_two_end_network()
+        net.gens["g2"].gen_mode = "PQ"
+        ok, msg = run_power_flow(net)
+        assert ok, msg
+        assert net.gen_p_mw["g2"] == pytest.approx(40.0, abs=0.5)  # 定功率
+        assert net.gen_q_mvar["g2"] == pytest.approx(0.0, abs=1e-6)  # 无无功
+
+    def test_pv_vs_pq_voltage_differs(self):
+        net = build_5bus_two_end_network()
+        run_power_flow(net)
+        v_pv = net.bus_voltage_pu["b5"]
+        net.gens["g2"].gen_mode = "PQ"
+        run_power_flow(net)
+        v_pq = net.bus_voltage_pu["b5"]
+        assert v_pv != pytest.approx(v_pq, abs=1e-6), "PV/PQ 模式电压应不同"
+
+
+class TestDistributedSlack:
+    def test_distributed_slack_shares_loss(self):
+        """两台同权重机组: 分布式松弛下网损由两端共同承担"""
+        net = build_5bus_two_end_network()
+        net.gens["g2"].is_slack = True   # g2 变平衡, g1 为 PV
+        run_power_flow(net)               # 常规: 平衡机独自承担网损
+        p1_normal = net.gen_p_mw["g1"]
+        ok, msg = run_power_flow(net, distributed_slack=True)
+        assert ok, msg
+        p1_dist = net.gen_p_mw["g1"]
+        # 分布式松弛下 g1 也要分摊一部分网损, 出力偏离 setpoint
+        assert p1_dist != pytest.approx(p1_normal, abs=1e-4)
+
+
+class TestNMinus1Progress:
+    def test_progress_callback_called(self):
+        from solver import n_minus_1_check
+        net = build_5bus_two_end_network()
+        run_power_flow(net)
+        calls = []
+        report = n_minus_1_check(net, progress=lambda d, t: calls.append((d, t)))
+        assert len(calls) == len(report) == 4   # 4 条线路
+        assert calls[-1][1] == 4

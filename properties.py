@@ -60,6 +60,10 @@ class PropertiesPanel(QWidget):
             self._add_float(model, "p_mw", "有功 P (MW)", model.p_mw, 0, 5000, 1)
             self._add_float(model, "vm_pu", "电压 V (pu)", model.vm_pu, 0.8, 1.2, 4)
             self._add_check(model, "is_slack", "平衡节点 (Slack)")
+            self._add_combo_choice(model, "gen_mode", "节点类型",
+                                   ["PV", "PQ"], model.gen_mode)
+            self._add_float(model, "slack_weight", "松弛分摊权重",
+                            model.slack_weight, 0.0, 10.0, 2)
             self._add_float(model, "min_p_mw", "OPF 出力下限 (MW)", model.min_p_mw, -5000, 5000, 1)
             self._add_float(model, "max_p_mw", "OPF 出力上限 (MW)", model.max_p_mw, 0, 5000, 1)
             self._add_float(model, "cost_per_mw", "发电成本 (元/MWh)", model.cost_per_mw, 0, 10000, 1)
@@ -201,6 +205,20 @@ class PropertiesPanel(QWidget):
             cb.setCurrentIndex(idx)
         cb.currentIndexChanged.connect(
             lambda i: (self._set_attr(model, attr, cb.itemData(i)),
+                       self._commit_pending_edit())
+        )
+        self.form_layout.addRow(label, cb)
+        self._fields[attr] = cb
+
+    def _add_combo_choice(self, model, attr: str, label: str,
+                          choices, current) -> None:
+        from PyQt5.QtWidgets import QComboBox
+        cb = QComboBox()
+        cb.addItems([str(c) for c in choices])
+        idx = list(choices).index(current) if current in choices else 0
+        cb.setCurrentIndex(idx)
+        cb.currentIndexChanged.connect(
+            lambda i: (self._set_attr(model, attr, choices[i]),
                        self._commit_pending_edit())
         )
         self.form_layout.addRow(label, cb)

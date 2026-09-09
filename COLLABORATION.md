@@ -105,6 +105,17 @@ PowerFlowStudio/
 3. **拓扑/视图解耦**、**求解器抽 Backend 接口**（见第四节）
 4. **发电机 PV/PQ 类型切换**（is_slack 已支持, 全类型切换未做）
 
+### 其他 2026-09-10 二期新增能力速查 (v0.7.0, expand(round-N) 提交)
+
+- OPF 最优潮流: `solver.run_opf` (runopp + poly_cost, 发电机 min/max/cost 字段)
+- 三相短路: `solver.run_short_circuit` (PV 发电机自动补齐短路参数列)
+- 并联电容/电抗器元件: `ShuntUnit` 全栈 (builder/palette/properties/存档)
+- 变压器分接头 tap_pos: GUI_TRAFO 必须带 "tap_changer_type": "Ratio",
+  否则 pandapower 静默忽略分接头 (踩过的坑)
+- 网损统计: `net.total_loss_mw/q_mvar`
+- 小地图/搜索/对齐分布/属性编辑撤销: `ux.py` + properties 快照提交
+- 拓扑 IO 独立: `topo_io.py`
+
 ### 其他 2026-09-10 新增能力速查
 
 - N-1 校核：`solver.n_minus_1_check` + 计算菜单入口（逐条开断报告越限/孤立）

@@ -38,6 +38,7 @@ from palette import ComponentPalette
 from properties import PropertiesPanel
 from results import (  # noqa: F401  再导出, 对外接口与拆分前一致
     ResultsPanel, export_results_csv, render_scene_png,
+    render_scene_svg,
 )
 from topo_io import (  # noqa: F401  再导出, 兼容旧导入路径
     parse_topology_json, network_to_json_dict, _TOPO_SPEC,
@@ -45,7 +46,7 @@ from topo_io import (  # noqa: F401  再导出, 兼容旧导入路径
 from undocmds import SnapshotCommand
 from ux import SearchDialog, make_minimap_dock
 
-__version__ = "0.6.0"
+__version__ = "0.7.0"
 
 
 class PowerFlowThread(QThread):
@@ -159,6 +160,10 @@ class MainWindow(QMainWindow):
         self.act_dc.toggled.connect(
             lambda c: self.mode_label.setText("DC" if c else "AC"))
         toolbar.addAction(self.act_dc)
+        self.act_dslack = QAction("分布式松弛", self)
+        self.act_dslack.setCheckable(True)
+        self.act_dslack.setStatusTip("按各发电机松弛权重分摊网损功率 (属性面板可设权重)")
+        toolbar.addAction(self.act_dslack)
         act_clear = QAction("✖ 清空画布", self)
         act_clear.triggered.connect(self._clear_canvas)
         toolbar.addAction(act_clear)
@@ -211,6 +216,9 @@ class MainWindow(QMainWindow):
         act_png = QAction("导出画布 PNG(&P)...", self)
         act_png.triggered.connect(self._export_png)
         menu_file.addAction(act_png)
+        act_svg = QAction("导出画布 SVG(&G)...", self)
+        act_svg.triggered.connect(self._export_svg)
+        menu_file.addAction(act_svg)
         act_export2 = QAction("导出结果 CSV(&C)...", self)
         act_export2.triggered.connect(self._export_csv)
         menu_file.addAction(act_export2)
@@ -299,9 +307,7 @@ class MainWindow(QMainWindow):
         # Status bar
         # 上次自动保存时间提示(须在状态栏创建前算好)
         autosave_ts = self._recent_settings().value("autosave_time", "")
-        if autosave_ts and os.path.exists(
-                os.path.join(tempfile.gettempdir(),
-                             "PowerFlowStudio_autosave.json")):
+        if autosave_ts and any(os.path.exists(p) for p in self._autosave_paths()):
             self._startup_autosave_hint = (
                 f"上次自动保存: {autosave_ts} (文件-恢复自动保存 可取回)")
         else:
@@ -317,6 +323,9 @@ class MainWindow(QMainWindow):
         self.stats_label = QLabel("")
         self.stats_label.setToolTip("画布元件统计")
         self.status.addPermanentWidget(self.stats_label)
+        self.coord_label = QLabel("")
+        self.coord_label.setToolTip("光标画布坐标")
+        self.status.addPermanentWidget(self.coord_label)
         self._refresh_stats()
 
         # Shortcuts
@@ -363,6 +372,9 @@ class MainWindow(QMainWindow):
         self._search_dialog.raise_()
         self._search_dialog.edit.setFocus()
 
+    def _update_coords(self, x: float, y: float):
+        self.coord_label.setText(f"({x:.0f}, {y:.0f})")
+
     def _refresh_minimap(self):
         if self.minimap_dock.isVisible():
             self.minimap_dock._minimap_view.refresh()
@@ -385,18 +397,32 @@ class MainWindow(QMainWindow):
         return n
 
     # ---------- 自动保存 ----------
+    AUTOSAVE_SLOTS = 3   # 轮转保留最近 3 份, 防止恰好存了坏状态
+
+    def _autosave_paths(self):
+        return [os.path.join(tempfile.gettempdir(),
+                             f"PowerFlowStudio_autosave_{i}.json")
+                for i in range(self.AUTOSAVE_SLOTS)]
+
     def _autosave_path(self) -> str:
-        return os.path.join(tempfile.gettempdir(), "PowerFlowStudio_autosave.json")
+        """兼容旧接口: 返回最新一份自动保存文件路径"""
+        existing = [p for p in self._autosave_paths() if os.path.exists(p)]
+        if existing:
+            return max(existing, key=os.path.getmtime)
+        return self._autosave_paths()[0]
 
     def _autosave(self):
         if not self._dirty or not self.network.buses:
             return
         try:
+            s = self._recent_settings()
+            idx = int(s.value("autosave_idx", 0) or 0) % self.AUTOSAVE_SLOTS
+            path = self._autosave_paths()[idx]
             data = network_to_json_dict(self.network)
-            with open(self._autosave_path(), "w", encoding="utf-8") as f:
+            with open(path, "w", encoding="utf-8") as f:
                 json.dump(data, f, ensure_ascii=False, indent=2)
-            self._recent_settings().setValue(
-                "autosave_time", time.strftime("%Y-%m-%d %H:%M:%S"))
+            s.setValue("autosave_idx", idx + 1)
+            s.setValue("autosave_time", time.strftime("%Y-%m-%d %H:%M:%S"))
         except Exception:
             logging.getLogger("powerflow.crash").exception("自动保存失败")
 
@@ -568,6 +594,21 @@ class MainWindow(QMainWindow):
                 "— 各母线属性面板可查", 8000)
         return True, ""
 
+    def _export_svg(self):
+        path, _ = QFileDialog.getSaveFileName(
+            self, "导出画布 SVG", "grid.svg", "SVG (*.svg)"
+        )
+        if not path:
+            return False
+        if not self.scene.items():
+            self.status.showMessage("画布是空的, 没有可导出的内容", 4000)
+            return False
+        if render_scene_svg(self.scene, path):
+            self.status.showMessage(f"已导出 {path}", 5000)
+            return True
+        self.status.showMessage("导出失败", 4000)
+        return False
+
     def _run_n_minus_1(self, interactive: bool = True):
         """N-1 校核: 逐条开断线路/变压器重跑潮流, 报告越限与孤立母线。
 
@@ -589,9 +630,26 @@ class MainWindow(QMainWindow):
             self.status.showMessage("画布上需要一个可计算的网络(至少母线+发电机)", 5000)
             return None
         algorithm = "dc" if self.act_dc.isChecked() else "nr"
+        n_branch = len(self.network.lines) + len(self.network.trafos)
+        progress = None
+        if n_branch > 30:
+            from PyQt5.QtWidgets import QProgressDialog
+            progress = QProgressDialog("N-1 校核计算中…", "取消", 0, n_branch, self)
+            progress.setWindowModality(Qt.WindowModal)
+            progress.setMinimumDuration(0)
+
+        def _on_progress(done, total):
+            if progress is not None:
+                progress.setValue(done)
+                QApplication.processEvents()
+
         self.status.showMessage("⏳ N-1 校核计算中...", 0)
         QApplication.processEvents()
-        report = n_minus_1_check(self.network, algorithm=algorithm)
+        report = n_minus_1_check(self.network, algorithm=algorithm,
+                                 progress=_on_progress)
+        if progress is not None:
+            progress.setValue(n_branch)
+            progress.close()
         self._refresh_stats()
         if "_base_failed" not in report:
             self.scene.refresh_results()
@@ -689,7 +747,8 @@ class MainWindow(QMainWindow):
             self._pf_thread.start()
             return True, ""
         t0 = time.perf_counter()
-        ok, err = run_power_flow(self.network, algorithm=algorithm)
+        ok, err = run_power_flow(self.network, algorithm=algorithm,
+                                 distributed_slack=self.act_dslack.isChecked())
         elapsed_ms = (time.perf_counter() - t0) * 1000.0
         return self._finish_power_flow(ok, err, elapsed_ms)
 

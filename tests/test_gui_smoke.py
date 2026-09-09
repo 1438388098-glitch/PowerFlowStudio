@@ -1063,3 +1063,33 @@ class TestRoundBFeatures:
         gen_after = next(it for it in w.scene._comp_by_uid.values()
                          if it.model.name == "G1")
         assert gen_after.model.p_mw == pytest.approx(p_old), "撤销应恢复原参数"
+
+
+class TestRoundDFeatures:
+    def test_gen_mode_combo_in_form(self, qapp):
+        from properties import PropertiesPanel
+        from canvas import CircuitScene
+        from solver import Network
+        scene = CircuitScene(Network())
+        g = scene.add_component("Gen", 150, 150)
+        panel = PropertiesPanel()
+        panel.attach_scene(scene)
+        panel.show_component(g)
+        assert "gen_mode" in panel._fields
+        assert "slack_weight" in panel._fields
+
+    def test_svg_export(self, qapp, tmp_path):
+        from app import MainWindow, render_scene_svg
+        w = MainWindow()
+        w._load_two_end_demo()
+        path = str(tmp_path / "grid.svg")
+        assert render_scene_svg(w.scene, path)
+        assert os.path.getsize(path) > 3000
+
+    def test_distributed_slack_toggle(self, qapp):
+        from app import MainWindow
+        w = MainWindow()
+        assert w.act_dslack.isChecked() is False
+        w.act_dslack.setChecked(True)
+        w._load_demo()
+        assert w.network.converged

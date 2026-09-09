@@ -23,7 +23,7 @@ jobs:
           pip install -r requirements-dev.txt
       - name: Byte-compile all modules
         run: python -m compileall -q app.py canvas.py palette.py properties.py solver.py defaults.py results.py undocmds.py ieee_cases.py
-      - name: Run tests
+      - name: Run tests with coverage
         env:
           QT_QPA_PLATFORM: offscreen
-        run: python -m pytest tests -q
+        run: python -m pytest tests -q --cov=. --cov-report=term

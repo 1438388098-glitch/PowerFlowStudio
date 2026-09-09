@@ -220,14 +220,19 @@ def export_results_csv(net: Network, base_path: str) -> dict:
     bus_csv = base + "_母线.csv"
     branch_csv = base + "_支路.csv"
     genload_csv = base + "_电源与负荷.csv"
+    has_ikss = bool(net.bus_ikss_ka)
     with open(bus_csv, "w", newline="", encoding="utf-8-sig") as f:
         w = csv.writer(f)
-        w.writerow(["母线", "V(pu)", "V(kV)", "相角(°)"])
+        w.writerow(["母线", "V(pu)", "V(kV)", "相角(°)"]
+                   + (["Ikss(kA)"] if has_ikss else []))
         for uid, b in sorted(net.buses.items(), key=lambda kv: kv[1].name):
-            w.writerow([b.name,
-                        _fmt(net.bus_voltage_pu.get(uid), 4),
-                        _fmt(net.bus_voltage_kv.get(uid), 2),
-                        _fmt(net.bus_va_degree.get(uid))])
+            row = [b.name,
+                   _fmt(net.bus_voltage_pu.get(uid), 4),
+                   _fmt(net.bus_voltage_kv.get(uid), 2),
+                   _fmt(net.bus_va_degree.get(uid))]
+            if has_ikss:
+                row.append(_fmt(net.bus_ikss_ka.get(uid), 3))
+            w.writerow(row)
     with open(branch_csv, "w", newline="", encoding="utf-8-sig") as f:
         w = csv.writer(f)
         w.writerow(["类型", "名称", "P(MW)", "Q(Mvar)", "负载率(%)"])
@@ -279,3 +284,25 @@ def render_scene_png(scene, path: str, scale: float = 2.0) -> bool:
     scene.render(painter, target=QRectF(img.rect()), source=rect)
     painter.end()
     return img.save(path)
+
+
+def render_scene_svg(scene, path: str) -> bool:
+    """把画布渲染成矢量 SVG (论文/报告无损缩放)"""
+    from PyQt5.QtCore import QRectF
+    from PyQt5.QtGui import QPainter
+    from PyQt5.QtSvg import QSvgGenerator
+    rect = scene.itemsBoundingRect().adjusted(-40, -40, 40, 40)
+    gen = QSvgGenerator()
+    gen.setFileName(path)
+    gen.setSize(rect.size().toSize())
+    gen.setViewBox(QRectF(0, 0, rect.width(), rect.height()))
+    gen.setTitle("PowerFlowStudio grid")
+    painter = QPainter(gen)
+    painter.setRenderHint(QPainter.Antialiasing)
+    scene.render(painter, target=QRectF(0, 0, rect.width(), rect.height()),
+                 source=rect)
+    painter.end()
+    return os.path.exists(path)
+
+
+import os  # noqa: E402  (置于文件尾供 render_scene_svg 使用)

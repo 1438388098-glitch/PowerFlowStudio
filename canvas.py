@@ -623,6 +623,12 @@ class CircuitView(QGraphicsView):
             self._rubber_line.setPath(path)
             event.accept()
             return
+        # 状态栏光标画布坐标
+        win = self.window()
+        if hasattr(win, "_update_coords"):
+            sp = self.mapToScene(event.pos().toPoint()
+                                 if hasattr(event.pos(), "toPoint") else event.pos())
+            win._update_coords(sp.x(), sp.y())
         super().mouseMoveEvent(event)
 
     def mouseReleaseEvent(self, event):

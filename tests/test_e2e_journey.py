@@ -109,3 +109,35 @@ def test_full_user_journey(qapp, tmp_path):
     w.close()
     w2._set_dirty(False)
     w2.close()
+
+
+def test_full_journey_phase2(qapp, tmp_path):
+    """二期功能旅程: OPF → 短路 → Shunt 电压调节 → CSV 含 Ikss 列"""
+    from app import MainWindow, export_results_csv
+    w = MainWindow()
+    w._load_two_end_demo()
+
+    # OPF: 收敛, 机组出力为优化解
+    ok, err = w._run_opf()
+    assert ok, err
+    assert all(v == v for v in w.network.gen_p_mw.values())
+
+    # 短路: 母线 Ikss 齐全
+    ok, err = w._run_short_circuit("max")
+    assert ok, err
+    assert len(w.network.bus_ikss_ka) == 5
+
+    # 短路结果随母线 CSV 导出
+    paths = export_results_csv(w.network, str(tmp_path / "sc"))
+    assert "Ikss(kA)" in open(paths["bus"], encoding="utf-8-sig").read()
+
+    # Shunt: 加电容抬高母线电压 (重新潮流)
+    sh = w.scene.add_component("Shunt", 560, 150)
+    sh.model.q_mvar = -20.0
+    w.act_dc.setChecked(False)
+    ok, err = w._run_power_flow()
+    assert ok, err
+    uid_of = {b.name: u for u, b in w.network.buses.items()}
+    assert "B3" in uid_of
+    w._set_dirty(False)
+    w.close()
