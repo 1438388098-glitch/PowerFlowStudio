@@ -252,3 +252,173 @@ class TestDemos:
         assert loads["L2"] == (20.0, 8.0)
         gens = {g.name: g.vm_pu for g in w.network.gens.values()}
         assert gens["G1"] == 1.05 and gens["G2"] == 1.05
+
+
+class TestRound3Features:
+    def test_drag_gen_line_to_bus_rebinds(self, scene):
+        """Gen 拖线连到另一条母线: bus_uid 真正改挂 (不再是视觉装饰)"""
+        b1 = scene.add_component("Bus", 100, 300)
+        b2 = scene.add_component("Bus", 600, 300)
+        g = scene.add_component("Gen", 130, 180)   # 自动挂到 b1
+        assert g.model.bus_uid == b1.model.uid
+        scene.create_connection(g, g.port_item("out"), b2, b2.port_item("left"))
+        assert g.model.bus_uid == b2.model.uid, "拖线换母线未转正"
+        assert g.model.uid in scene._internal_links.get(b2.model.uid, [])
+        assert g.model.uid not in scene._internal_links.get(b1.model.uid, [])
+
+    def test_export_results_csv(self, qapp, tmp_path):
+        from app import export_results_csv
+        from solver import (
+            run_power_flow, BusNode, GenUnit, LoadUnit, LineBranch)
+        net = Network()
+        for uid, x in (("b1", 0), ("b2", 300)):
+            net.buses[uid] = BusNode(uid=uid, name=uid.upper(), x=x, y=0)
+        net.gens["g1"] = GenUnit(uid="g1", name="G1", bus_uid="b1")
+        net.loads["l1"] = LoadUnit(uid="l1", name="L1", bus_uid="b2")
+        net.lines["ln1"] = LineBranch(uid="ln1", name="L1", from_bus="b1", to_bus="b2")
+        ok, msg = run_power_flow(net)
+        assert ok, msg
+        base = str(tmp_path / "out")
+        bus_csv, branch_csv = export_results_csv(net, base)
+        assert bus_csv.endswith("_母线.csv") and branch_csv.endswith("_支路.csv")
+        bus_text = open(bus_csv, encoding="utf-8-sig").read()
+        assert "B1" in bus_text and "V(pu)" in bus_text
+        branch_text = open(branch_csv, encoding="utf-8-sig").read()
+        assert "线路" in branch_text and "负载率" in branch_text
+
+    def test_results_panel_fills_tables(self, qapp):
+        from app import ResultsPanel
+        from canvas import CircuitScene
+        from solver import run_power_flow
+        scene = CircuitScene(Network())
+        scene.add_component("Bus", 100, 100)
+        scene.add_component("Bus", 400, 100)
+        a, b = _bus_items(scene)
+        scene.create_connection(a, a.port_item("right"), b, b.port_item("left"))
+        scene.add_component("Gen", 130, 180)
+        ok, msg = run_power_flow(scene.network)
+        assert ok, msg
+        panel = ResultsPanel()
+        panel.refresh(scene.network)
+        assert panel.bus_table.rowCount() == 2
+        assert panel.branch_table.rowCount() == 1
+        assert panel.branch_table.item(0, 0).text() == "线路"
+
+    def test_dc_toggle_changes_algorithm(self, qapp):
+        from app import MainWindow
+        w = MainWindow()
+        assert w.act_dc.isChecked() is False
+        w._load_demo()
+        v_ac = dict(w.network.bus_voltage_pu)
+        assert w.network.converged
+        # 打开 DC 再跑
+        w.act_dc.setChecked(True)
+        ok, err = w._run_power_flow()
+        assert ok, err
+        assert "DC" in w.status.currentMessage()
+
+
+class TestRound4Features:
+    def test_undo_redo_add_delete(self, qapp):
+        """快照式撤销: 添加→撤销→画布空, 重做→元件回来"""
+        from app import MainWindow
+        w = MainWindow()
+        w.scene.add_component("Bus", 100, 100)
+        assert len(w.network.buses) == 1
+        assert w.undo_stack.canUndo()
+        w.undo_stack.undo()
+        assert len(w.network.buses) == 0
+        assert len(w.scene._comp_by_uid) == 0
+        w.undo_stack.redo()
+        assert len(w.network.buses) == 1
+        assert len(w.scene._comp_by_uid) == 1
+
+    def test_undo_delete_restores_element(self, qapp):
+        from app import MainWindow
+        w = MainWindow()
+        w.scene.add_component("Bus", 100, 100)
+        w.scene.add_component("Gen", 130, 150)
+        uid = next(iter(w.network.gens))
+        w.scene.delete_item(w.scene._comp_by_uid[uid])
+        assert len(w.network.gens) == 0
+        w.undo_stack.undo()
+        assert uid in w.network.gens, "删除的发电机应被撤销恢复"
+
+    def test_dirty_flag_and_title(self, qapp):
+        from app import MainWindow
+        w = MainWindow()
+        assert w._dirty is False
+        assert "*" not in w.windowTitle()
+        w.scene.add_component("Bus", 100, 100)
+        assert w._dirty is True
+        assert "*" in w.windowTitle()
+        w._set_dirty(False)
+        assert "*" not in w.windowTitle()
+
+    def test_confirm_discard_changes(self, qapp, monkeypatch):
+        from app import MainWindow
+        from PyQt5.QtWidgets import QMessageBox
+        w = MainWindow()
+        w._set_dirty(True)
+        answers = {"No": QMessageBox.No, "Cancel": QMessageBox.Cancel}
+        for label, expected_ok in (("No", True), ("Cancel", False)):
+            monkeypatch.setattr(
+                "app.QMessageBox.question",
+                lambda *a, **k: answers[label])
+            assert w.confirm_discard_changes() is expected_ok
+
+    def test_atomic_save_no_tmp_leftover(self, qapp, tmp_path):
+        from app import MainWindow
+        w = MainWindow()
+        w.scene.add_component("Bus", 100, 100)
+        path = str(tmp_path / "t.json")
+        w._save_topology(path)
+        assert os.path.exists(path)
+        assert not os.path.exists(path + ".tmp"), "原子写的临时文件应被替换掉"
+
+    def test_pf_thread_runs_in_copy(self, qapp):
+        from app import PowerFlowThread
+        from test_solver import build_3bus_network
+        net = build_3bus_network()
+        t = PowerFlowThread(net, "nr")
+        results = []
+        t.done.connect(lambda c, ok, err, ms: results.append(ok))
+        t.run()   # 同步调用 run, 不开事件循环
+        assert results and results[0] is True
+        # 原网络未被后台计算污染 (结果在副本上)
+        assert len(net.bus_voltage_pu) == 0
+
+    def test_results_plot_handles_nan(self, qapp):
+        from app import ResultsPanel
+        from solver import run_power_flow, BusNode
+        from test_solver import build_3bus_network
+        net = build_3bus_network()
+        net.buses["iso"] = BusNode(uid="iso", name="ISO", x=900, y=900)
+        ok, msg = run_power_flow(net)
+        assert ok, msg
+        panel = ResultsPanel()
+        panel.refresh(net)   # NaN 电压不得让绘图崩掉
+        assert panel.bus_table.rowCount() == 4
+
+    def test_ieee_case14_loads_and_converges(self, qapp):
+        """README 扩展方向 #3: IEEE 标准算例一键加载"""
+        from app import MainWindow
+        w = MainWindow()
+        w._load_ieee_case("case14")
+        assert len(w.network.buses) == 14
+        assert w.network.converged, "case14 应收敛"
+        assert len(w.network.trafos) >= 1
+        assert len(w.network.gens) >= 1
+
+    def test_ieee_case30_converges(self):
+        from ieee_cases import load_case
+        from solver import run_power_flow
+        net = load_case("case30")
+        ok, msg = run_power_flow(net)
+        assert ok, f"case30 不收敛: {msg}"
+
+    def test_load_case_rejects_unknown(self):
+        from ieee_cases import load_case
+        import pytest
+        with pytest.raises(ValueError):
+            load_case("case999")

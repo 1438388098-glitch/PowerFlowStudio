@@ -234,6 +234,10 @@ class TestTrafoAndImpedance:
         assert ok, msg
         assert "b2" in net.bus_voltage_pu
         assert net.bus_voltage_pu["b2"] > 0.5
+        # 阻抗结果已提取 (round3: impedance P/Q 回写)
+        assert "z1" in net.impedance_p_from_mw
+        assert "z1" in net.impedance_p_to_mw
+        assert abs(net.impedance_p_from_mw["z1"]) > 0
 
 
 class TestRerunClearsOldResults:
@@ -247,3 +251,22 @@ class TestRerunClearsOldResults:
         ok, msg = run_power_flow(net)
         assert ok, msg
         assert "ln2" not in net.line_loading_percent
+
+
+class TestDcPowerFlow:
+    def test_dc_mode_converges(self):
+        """DC 直流潮流: 收敛, 相角有结果, 有功近似平衡"""
+        net = build_3bus_network()
+        ok, msg = run_power_flow(net, algorithm="dc")
+        assert ok, msg
+        assert len(net.bus_va_degree) == 3
+        gen_p = sum(net.gen_p_mw.values())
+        load_p = sum(net.load_p_mw.values())
+        assert gen_p == pytest.approx(load_p, abs=1.0)
+
+    def test_default_algorithm_is_nr(self):
+        net = build_3bus_network()
+        ok, _ = run_power_flow(net)
+        assert ok
+        # NR 模式下电压有真实结果(非恒定 1.0)
+        assert any(abs(v - 1.0) > 1e-6 for v in net.bus_voltage_pu.values())

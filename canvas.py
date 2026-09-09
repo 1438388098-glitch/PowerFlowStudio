@@ -3,6 +3,7 @@ canvas.py — 画布(QGraphicsView + QGraphicsScene)
 支持元件拖拽, 连线, 删除, 选中, 属性编辑联动
 """
 from __future__ import annotations
+import logging
 import uuid
 from typing import Dict, Optional, List
 
@@ -13,13 +14,14 @@ from PyQt5.QtGui import (
 from PyQt5.QtWidgets import (
     QGraphicsScene, QGraphicsView, QGraphicsItem,
     QGraphicsEllipseItem, QGraphicsRectItem, QGraphicsPathItem,
-    QGraphicsTextItem
+    QGraphicsTextItem, QMenu, QInputDialog
 )
 
 from solver import (
     Network, BusNode, GenUnit, LoadUnit,
     LineBranch, TrafoBranch, ImpedanceBranch
 )
+import defaults as D
 
 
 # ============================================================
@@ -441,10 +443,7 @@ class CircuitView(QGraphicsView):
                 return
             comp = self.scene().add_component(kind, x, y)
         except Exception:
-            import traceback
-            with open("crash.log", "a", encoding="utf-8") as f:
-                f.write("\n=== dropEvent exception ===\n")
-                traceback.print_exc(file=f)
+            logging.getLogger("powerflow.crash").exception("dropEvent exception")
             event.ignore()
             return
         self.scene().clearSelection()
@@ -574,11 +573,40 @@ class CircuitView(QGraphicsView):
                 if best_dist is None or d2 < best_dist:
                     best_dist = d2
                     best_port = port
-            # Accept ports within 80 px of the cursor (covers port dots
-            # and the immediate area around them).
-            if best_port is not None and best_dist is not None and best_dist <= 80 * 80:
+            # Accept ports within the snap radius of the cursor (covers
+            # port dots and the immediate area around them).
+            if best_port is not None and best_dist is not None \
+                    and best_dist <= D.PORT_SNAP_DIST ** 2:
                 return best_port
         return item
+
+    def contextMenuEvent(self, event):
+        """右键菜单: 元件=重命名/删除, 连线=删除, 空白=运行潮流/适配视图"""
+        menu = QMenu(self)
+        item = self.itemAt(event.pos())
+        win = self.window()
+        if isinstance(item, BaseComponent):
+            def _rename():
+                text, ok = QInputDialog.getText(
+                    self, "重命名", "新名称:", text=item.model.name)
+                if ok and text.strip():
+                    item.update_label(text.strip())
+            act_rename = menu.addAction(f"重命名 {item.model.name}")
+            act_rename.triggered.connect(_rename)
+            act_del = menu.addAction("删除")
+            act_del.triggered.connect(lambda: self.scene().delete_item(item))
+        elif isinstance(item, ConnectionItem):
+            act_del = menu.addAction("删除连线")
+            act_del.triggered.connect(lambda: self.scene().delete_item(item))
+        else:
+            if hasattr(win, "_run_power_flow"):
+                act_run = menu.addAction("▶ 运行潮流")
+                act_run.triggered.connect(win._run_power_flow)
+            act_fit = menu.addAction("⤢ 适配视图")
+            act_fit.triggered.connect(self.fit_view)
+        if menu.actions():
+            menu.exec_(event.globalPos())
+        super().contextMenuEvent(event)
 
     def keyPressEvent(self, event):
         # ESC: 正在拖连线则取消拖拽, 否则取消选中
@@ -620,25 +648,51 @@ class CircuitScene(QGraphicsScene):
     def __init__(self, network: Network, parent=None):
         super().__init__(parent)
         self.network = network
-        self.setSceneRect(0, 0, 2000, 1400)
+        self.setSceneRect(0, 0, D.CANVAS_WIDTH, D.CANVAS_HEIGHT)
         self._comp_by_uid: Dict[str, BaseComponent] = {}
         self._connections: List[ConnectionItem] = []
         self._name_seq: Dict[str, int] = {}   # 显示名计数器, 按 prefix 分池
         self.selection_changed_handler = None
         self._view = None  # set by set_view() after construction
+        # 表驱动: kind -> (model 工厂, model 存入的 network 字典, Item 类)
+        # 加新元件类型只需: solver 加 dataclass + 这里加一行 + properties 加表单
+        self._builders = {
+            "Bus": (self._make_bus_model, self.network.buses, BusItem, "B"),
+            "Gen": (self._make_gen_model, self.network.gens, GenItem, "G"),
+            "Load": (self._make_load_model, self.network.loads, LoadItem, "L"),
+            "Trafo": (self._make_trafo_model, self.network.trafos, TrafoItem, "T"),
+            "Impedance": (self._make_impedance_model, self.network.impedances, ImpedanceItem, "Z"),
+        }
 
-    def set_view(self, view):
-        """Optional back-reference so drop / scene events can reach the view
-        (and through it, the status bar)."""
-        self._view = view
+    # ---- 各元件的 model 工厂(自动绑定母线) ----
+    def _make_bus_model(self, uid, name, x, y):
+        return BusNode(uid=uid, name=name, x=x, y=y, vn_kv=D.DEFAULT_VN_KV)
 
-    def _on_drop(self, comp, kind):
-        """Hook called by CircuitView.dropEvent after a successful drop."""
-        name = getattr(comp.model, "name", "?")
-        if self._view is not None and hasattr(self._view, "window"):
-            win = self._view.window()
-            if hasattr(win, "status"):
-                win.status.showMessage(f"已创建 {kind}  {name}", 3000)
+    def _make_gen_model(self, uid, name, x, y):
+        bus_uid = self._nearest_bus(x, y)
+        if bus_uid is None:
+            bus_uid = self._ensure_first_bus(x, y)
+        return GenUnit(uid=uid, name=name, bus_uid=bus_uid)
+
+    def _make_load_model(self, uid, name, x, y):
+        bus_uid = self._nearest_bus(x, y)
+        if bus_uid is None:
+            bus_uid = self._ensure_first_bus(x, y)
+        return LoadUnit(uid=uid, name=name, bus_uid=bus_uid)
+
+    def _make_trafo_model(self, uid, name, x, y):
+        uid_a = self._nearest_bus(x, y - D.AUTO_BUS_OFFSET)
+        uid_b = self._nearest_bus(x, y + D.AUTO_BUS_OFFSET)
+        if uid_a is None or uid_b is None or uid_a == uid_b:
+            uid_a, uid_b = self._ensure_two_buses(x, y)
+        return TrafoBranch(uid=uid, name=name, hv_bus=uid_a, lv_bus=uid_b)
+
+    def _make_impedance_model(self, uid, name, x, y):
+        uid_a = self._nearest_bus(x, y - D.AUTO_BUS_OFFSET)
+        uid_b = self._nearest_bus(x, y + D.AUTO_BUS_OFFSET)
+        if uid_a is None or uid_b is None or uid_a == uid_b:
+            uid_a, uid_b = self._ensure_two_buses(x, y)
+        return ImpedanceBranch(uid=uid, name=name, from_bus=uid_a, to_bus=uid_b)
 
     # ------- 元件创建 / 删除 -------
     def _next_name(self, prefix: str, container: dict, seq_key: Optional[str] = None) -> str:
@@ -658,57 +712,14 @@ class CircuitScene(QGraphicsScene):
                 return candidate
 
     def add_component(self, kind: str, x: float, y: float, name: Optional[str] = None):
-        uid = uuid.uuid4().hex[:8]
-        if kind == "Bus":
-            name = name or self._next_name("B", self.network.buses)
-            model = BusNode(uid=uid, name=name, x=x, y=y, vn_kv=110.0)
-            self.network.buses[uid] = model
-            item = BusItem(model)
-        elif kind == "Gen":
-            name = name or self._next_name("G", self.network.gens)
-            # 默认挂到最近母线
-            bus_uid = self._nearest_bus(x, y)
-            if bus_uid is None:
-                bus_uid = self._ensure_first_bus(x, y)
-            model = GenUnit(uid=uid, name=name, bus_uid=bus_uid, p_mw=50, vm_pu=1.0)
-            self.network.gens[uid] = model
-            item = GenItem(model)
-        elif kind == "Load":
-            name = name or self._next_name("L", self.network.loads)
-            bus_uid = self._nearest_bus(x, y)
-            if bus_uid is None:
-                bus_uid = self._ensure_first_bus(x, y)
-            model = LoadUnit(uid=uid, name=name, bus_uid=bus_uid, p_mw=10, q_mvar=5)
-            self.network.loads[uid] = model
-            item = LoadItem(model)
-        elif kind == "Trafo":
-            name = name or self._next_name("T", self.network.trafos)
-            uid_a = self._nearest_bus(x, y - 30)
-            uid_b = self._nearest_bus(x, y + 30)
-            if uid_a is None or uid_b is None or uid_a == uid_b:
-                a, b = self._ensure_two_buses(x, y)
-                uid_a, uid_b = a, b
-            model = TrafoBranch(
-                uid=uid, name=name, hv_bus=uid_a, lv_bus=uid_b,
-                sn_mva=63, vn_hv_kv=110, vn_lv_kv=35
-            )
-            self.network.trafos[uid] = model
-            item = TrafoItem(model)
-        elif kind == "Impedance":
-            name = name or self._next_name("Z", self.network.impedances)
-            uid_a = self._nearest_bus(x, y - 30)
-            uid_b = self._nearest_bus(x, y + 30)
-            if uid_a is None or uid_b is None or uid_a == uid_b:
-                a, b = self._ensure_two_buses(x, y)
-                uid_a, uid_b = a, b
-            model = ImpedanceBranch(
-                uid=uid, name=name, from_bus=uid_a, to_bus=uid_b
-            )
-            self.network.impedances[uid] = model
-            item = ImpedanceItem(model)
-        else:
+        if kind not in self._builders:
             raise ValueError(f"未知元件种类: {kind}")
-
+        make_model, container, item_cls, prefix = self._builders[kind]
+        uid = uuid.uuid4().hex[:8]
+        name = name or self._next_name(prefix, container)
+        model = make_model(uid, name, x, y)
+        container[uid] = model
+        item = item_cls(model)
         item.setPos(x, y)
         self.addItem(item)
         self._comp_by_uid[uid] = item
@@ -719,18 +730,31 @@ class CircuitScene(QGraphicsScene):
 
         return item
 
+    def set_view(self, view):
+        """Optional back-reference so drop / scene events can reach the view
+        (and through it, the status bar)."""
+        self._view = view
+
+    def _on_drop(self, comp, kind):
+        """Hook called by CircuitView.dropEvent after a successful drop."""
+        name = getattr(comp.model, "name", "?")
+        if self._view is not None and hasattr(self._view, "window"):
+            win = self._view.window()
+            if hasattr(win, "status"):
+                win.status.showMessage(f"已创建 {kind}  {name}", 3000)
+
     def _ensure_first_bus(self, x, y):
         # 没有任何母线时自动建一个
         return self.add_component("Bus", x, y).model.uid
 
     def _ensure_two_buses(self, x, y):
-        a = self.add_component("Bus", x - 30, y - 30).model.uid
-        b = self.add_component("Bus", x + 30, y + 30).model.uid
+        a = self.add_component("Bus", x - D.AUTO_BUS_OFFSET, y - D.AUTO_BUS_OFFSET).model.uid
+        b = self.add_component("Bus", x + D.AUTO_BUS_OFFSET, y + D.AUTO_BUS_OFFSET).model.uid
         if a == b:   # 两次都吸附到了同一条母线: 强制新建一条
-            b = self.add_component("Bus", x + 60, y + 30).model.uid
+            b = self.add_component("Bus", x + 2 * D.AUTO_BUS_OFFSET, y + D.AUTO_BUS_OFFSET).model.uid
         return a, b
 
-    def _nearest_bus(self, x, y, max_dist=200):
+    def _nearest_bus(self, x, y, max_dist=D.NEAREST_BUS_DIST):
         best = None
         best_d = max_dist ** 2
         for uid, b in self.network.buses.items():
@@ -806,6 +830,17 @@ class CircuitScene(QGraphicsScene):
             conn.kind = "LineComp-Link"
             conn.uid = ""
         else:
+            # Gen/Load 拖线连到母线: 把挂接关系转正 (bus_uid 改写)。
+            # 以前这种线只是视觉装饰, 用户把 Gen 拖线连到 B3, 实际拓扑
+            # 还挂在 B1 —— 语义陷阱。现在真正改挂接母线。
+            genload = None
+            bus = None
+            for x_item, y_item in ((a_item, b_item), (b_item, a_item)):
+                if isinstance(x_item, (GenItem, LoadItem)) and isinstance(y_item, BusItem):
+                    genload, bus = x_item, y_item
+                    break
+            if genload is not None:
+                self._rebind_genload_to_bus(genload, bus)
             # Gen / Load: just draw a visual line. Topology is bound
             # by the bus_uid recorded when the component was added.
             conn = ConnectionItem(a_item, a_port, b_item, b_port)
@@ -816,6 +851,24 @@ class CircuitScene(QGraphicsScene):
         a_item.register_connection(conn)
         b_item.register_connection(conn)
         self._connections.append(conn)
+
+    def _rebind_genload_to_bus(self, comp_item, bus_item):
+        """把 Gen/Load 的挂接母线改到 bus_item (拖线换母线的拓扑转正)"""
+        old_uid = comp_item.model.bus_uid
+        new_uid = bus_item.model.uid
+        if old_uid == new_uid:
+            return
+        comp_item.model.bus_uid = new_uid
+        if hasattr(self, "_internal_links"):
+            old_list = self._internal_links.get(old_uid)
+            if old_list and comp_item.model.uid in old_list:
+                old_list.remove(comp_item.model.uid)
+            self._internal_links.setdefault(new_uid, []).append(comp_item.model.uid)
+        if self._view is not None:
+            win = self._view.window()
+            if hasattr(win, "status"):
+                win.status.showMessage(
+                    f"{comp_item.model.name} 已改挂到 {bus_item.model.name}", 3000)
 
     def delete_item(self, item):
         if isinstance(item, BaseComponent):

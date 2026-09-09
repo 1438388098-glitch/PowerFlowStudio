@@ -7,6 +7,8 @@ from typing import Dict, Tuple
 
 import pandapower as pp
 
+import defaults as D
+
 
 # ============================================================
 # 1. 拓扑数据模型(画布层使用, 与 QGraphicsItem 解耦)
@@ -19,7 +21,7 @@ class BusNode:
     name: str                      # 显示名, 例 "B1"
     x: float                       # 画布坐标
     y: float
-    vn_kv: float = 110.0           # 额定电压(kV)
+    vn_kv: float = D.DEFAULT_VN_KV # 额定电压(kV)
 
 
 @dataclass
@@ -28,8 +30,8 @@ class GenUnit:
     uid: str
     name: str
     bus_uid: str                   # 挂接的母线 uid
-    p_mw: float = 50.0             # 有功 MW
-    vm_pu: float = 1.0             # 电压设定值 pu
+    p_mw: float = D.GEN_P_MW       # 有功 MW
+    vm_pu: float = D.GEN_VM_PU     # 电压设定值 pu
     x: float = 0.0                 # 相对母线的偏移
     y: float = 0.0
 
@@ -40,8 +42,8 @@ class LoadUnit:
     uid: str
     name: str
     bus_uid: str
-    p_mw: float = 10.0
-    q_mvar: float = 5.0
+    p_mw: float = D.LOAD_P_MW
+    q_mvar: float = D.LOAD_Q_MVAR
     x: float = 0.0
     y: float = 0.0
 
@@ -53,11 +55,11 @@ class LineBranch:
     name: str
     from_bus: str                  # 母线 uid
     to_bus: str
-    r_ohm_per_km: float = 0.4
-    x_ohm_per_km: float = 0.4
-    c_nf_per_km: float = 0.0
-    length_km: float = 10.0
-    max_i_ka: float = 0.6
+    r_ohm_per_km: float = D.LINE_R_OHM_PER_KM
+    x_ohm_per_km: float = D.LINE_X_OHM_PER_KM
+    c_nf_per_km: float = D.LINE_C_NF_PER_KM
+    length_km: float = D.LINE_LENGTH_KM
+    max_i_ka: float = D.LINE_MAX_I_KA
 
 
 @dataclass
@@ -67,11 +69,11 @@ class TrafoBranch:
     name: str
     hv_bus: str                    # 高压侧母线 uid
     lv_bus: str                    # 低压侧母线 uid
-    sn_mva: float = 63.0
-    vn_hv_kv: float = 110.0
-    vn_lv_kv: float = 35.0
-    vkr_percent: float = 0.4
-    vk_percent: float = 10.0
+    sn_mva: float = D.TRAFO_SN_MVA
+    vn_hv_kv: float = D.TRAFO_VN_HV_KV
+    vn_lv_kv: float = D.TRAFO_VN_LV_KV
+    vkr_percent: float = D.TRAFO_VKR_PERCENT
+    vk_percent: float = D.TRAFO_VK_PERCENT
     pfe_kw: float = 0.0
     i0_percent: float = 0.0
     shift_degree: float = 0.0
@@ -84,9 +86,9 @@ class ImpedanceBranch:
     name: str
     from_bus: str
     to_bus: str
-    rft_pu: float = 0.01           # R 从 from 视角的 pu
-    xft_pu: float = 0.01
-    sn_mva: float = 100.0
+    rft_pu: float = D.IMP_RFT_PU   # R 从 from 视角的 pu
+    xft_pu: float = D.IMP_XFT_PU
+    sn_mva: float = D.IMP_SN_MVA
 
 
 @dataclass
@@ -113,6 +115,11 @@ class Network:
     trafo_q_hv_mvar: Dict[str, float] = field(default_factory=dict)
     trafo_p_lv_mw: Dict[str, float] = field(default_factory=dict)
     trafo_q_lv_mvar: Dict[str, float] = field(default_factory=dict)
+    # 串联阻抗结果 (res_impedance: 两侧 P/Q)
+    impedance_p_from_mw: Dict[str, float] = field(default_factory=dict)
+    impedance_q_from_mvar: Dict[str, float] = field(default_factory=dict)
+    impedance_p_to_mw: Dict[str, float] = field(default_factory=dict)
+    impedance_q_to_mvar: Dict[str, float] = field(default_factory=dict)
     # Per-generator / per-load results (PV node's actual Q output, etc.)
     gen_p_mw: Dict[str, float] = field(default_factory=dict)
     gen_q_mvar: Dict[str, float] = field(default_factory=dict)
@@ -134,6 +141,8 @@ _RESULT_FIELDS = (
     "line_p_to_mw", "line_q_to_mvar",
     "trafo_loading_percent", "trafo_p_hv_mw", "trafo_q_hv_mvar",
     "trafo_p_lv_mw", "trafo_q_lv_mvar",
+    "impedance_p_from_mw", "impedance_q_from_mvar",
+    "impedance_p_to_mw", "impedance_q_to_mvar",
     "gen_p_mw", "gen_q_mvar", "gen_vm_pu",
     "load_p_mw", "load_q_mvar",
 )
@@ -153,19 +162,21 @@ def build_pandapower(net: Network) -> Tuple[pp.pandapowerNet, Dict[str, Dict]]:
     返回 (pnet, id_maps)。id_maps 供 run_power_flow 把 pandapower 结果按
     元件 uid 反向索引 —— 全程走 pp 内部 id, 与显示名无关, 元件重名不影响
     结果归属:
-      id_maps["bus"]  : uid -> pp bus id
-      id_maps["line"] : uid -> pp line id
-      id_maps["trafo"]: uid -> pp trafo id
-      id_maps["ext"]  : pp ext_grid id -> gen uid (平衡节点)
-      id_maps["gen"]  : pp gen id -> gen uid (PV 节点)
-      id_maps["load"] : pp load id -> load uid
+      id_maps["bus"]       : uid -> pp bus id
+      id_maps["line"]      : uid -> pp line id
+      id_maps["trafo"]     : uid -> pp trafo id
+      id_maps["impedance"] : uid -> pp impedance id
+      id_maps["ext"]       : pp ext_grid id -> gen uid (平衡节点)
+      id_maps["gen"]       : pp gen id -> gen uid (PV 节点)
+      id_maps["load"]      : pp load id -> load uid
     要求 net 至少有一条母线和一个发电机(平衡节点), run_power_flow 已先行校验。
     ext_grid 和 gen 在 pandapower 是分开的两张表, 各自从 0 计数, 所以分开映射。
     """
     pnet = pp.create_empty_network(name="gui_circuit")
 
     id_maps: Dict[str, Dict] = {
-        "bus": {}, "line": {}, "trafo": {}, "ext": {}, "gen": {}, "load": {},
+        "bus": {}, "line": {}, "trafo": {}, "impedance": {},
+        "ext": {}, "gen": {}, "load": {},
     }
     bus_id_map = id_maps["bus"]
 
@@ -210,15 +221,17 @@ def build_pandapower(net: Network) -> Tuple[pp.pandapowerNet, Dict[str, Dict]]:
     # 自定义一个 GUI 用的线路/变压器型号
     pp.create_std_type(
         pnet,
-        {"r_ohm_per_km": 0.4, "x_ohm_per_km": 0.4, "c_nf_per_km": 0.0,
-         "max_i_ka": 0.6, "type": "cs"},
+        {"r_ohm_per_km": D.LINE_R_OHM_PER_KM, "x_ohm_per_km": D.LINE_X_OHM_PER_KM,
+         "c_nf_per_km": D.LINE_C_NF_PER_KM, "max_i_ka": D.LINE_MAX_I_KA,
+         "type": "cs"},
         name="GUI_LINE",
         element="line",
     )
     pp.create_std_type(
         pnet,
-        {"sn_mva": 63.0, "vn_hv_kv": 110.0, "vn_lv_kv": 35.0,
-         "vk_percent": 10.0, "vkr_percent": 0.4, "pfe_kw": 0.0,
+        {"sn_mva": D.TRAFO_SN_MVA, "vn_hv_kv": D.TRAFO_VN_HV_KV,
+         "vn_lv_kv": D.TRAFO_VN_LV_KV, "vk_percent": D.TRAFO_VK_PERCENT,
+         "vkr_percent": D.TRAFO_VKR_PERCENT, "pfe_kw": 0.0,
          "i0_percent": 0.0, "shift_degree": 0.0,
          "vector_group": "Dyn", "tap_side": "hv", "tap_neutral": 0,
          "tap_min": -2, "tap_max": 2, "tap_step_percent": 2.5,
@@ -264,7 +277,7 @@ def build_pandapower(net: Network) -> Tuple[pp.pandapowerNet, Dict[str, Dict]]:
 
     # 串联阻抗
     for uid, imp in net.impedances.items():
-        pp.create_impedance(
+        idx = pp.create_impedance(
             pnet,
             from_bus=bus_id_map[imp.from_bus],
             to_bus=bus_id_map[imp.to_bus],
@@ -273,6 +286,7 @@ def build_pandapower(net: Network) -> Tuple[pp.pandapowerNet, Dict[str, Dict]]:
             sn_mva=imp.sn_mva,
             name=imp.name,
         )
+        id_maps["impedance"][uid] = idx
 
     return pnet, id_maps
 
@@ -309,9 +323,10 @@ def _validate_topology(net: Network) -> str:
     return ""
 
 
-def run_power_flow(net: Network) -> Tuple[bool, str]:
+def run_power_flow(net: Network, algorithm: str = "nr") -> Tuple[bool, str]:
     """
     跑潮流, 把结果写回 net.bus_voltage_pu 等字段
+    algorithm: "nr" 牛顿-拉夫逊(默认) 或 "dc" 直流潮流(只算 P/相角, 电压全为 1.0)
     返回 (success, error_msg)
     """
     _clear_results(net)
@@ -329,7 +344,12 @@ def run_power_flow(net: Network) -> Tuple[bool, str]:
 
     try:
         pnet, id_maps = build_pandapower(net)
-        pp.runpp(pnet, algorithm="nr", init="flat", numba=False)
+        if algorithm == "dc":
+            # pandapower 3.x: 直流潮流是独立入口 rundcpp,
+            # runpp(algorithm="dc") 会 KeyError
+            pp.rundcpp(pnet, numba=False)
+        else:
+            pp.runpp(pnet, algorithm=algorithm, init="flat", numba=False)
     except pp.LoadflowNotConverged as e:
         _fail(net, f"潮流不收敛: {e}")
         return False, net.error_msg
@@ -365,6 +385,15 @@ def run_power_flow(net: Network) -> Tuple[bool, str]:
                 net.trafo_q_hv_mvar[uid] = float(res_trafo.at[pp_id, "q_hv_mvar"])
                 net.trafo_p_lv_mw[uid] = float(res_trafo.at[pp_id, "p_lv_mw"])
                 net.trafo_q_lv_mvar[uid] = float(res_trafo.at[pp_id, "q_lv_mvar"])
+
+        res_imp = getattr(pnet, "res_impedance", None)
+        if res_imp is not None:
+            for uid, pp_id in id_maps["impedance"].items():
+                if pp_id in res_imp.index:
+                    net.impedance_p_from_mw[uid] = float(res_imp.at[pp_id, "p_from_mw"])
+                    net.impedance_q_from_mvar[uid] = float(res_imp.at[pp_id, "q_from_mvar"])
+                    net.impedance_p_to_mw[uid] = float(res_imp.at[pp_id, "p_to_mw"])
+                    net.impedance_q_to_mvar[uid] = float(res_imp.at[pp_id, "q_to_mvar"])
 
         # PV gens — actual Q output (the result, not an input)
         for pp_id, uid in id_maps["gen"].items():

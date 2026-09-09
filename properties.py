@@ -207,9 +207,11 @@ class PropertiesPanel(QWidget):
                 self._add_result("实际无功 Q (Mvar)", f"{q:+.2f}" if q is not None else "—")
                 self._add_result("机端电压 (pu)", f"{vm:.4f}" if vm is not None else "—")
                 if vm is not None:
-                    if vm < 0.95:
+                    # 阈值与画布着色同一来源, 避免两处定义漂移
+                    from canvas import V_NORMAL, V_WARN_HIGH
+                    if vm < V_NORMAL:
                         self._add_result("状态", "⚠ 电压偏低")
-                    elif vm > 1.05:
+                    elif vm > V_WARN_HIGH:
                         self._add_result("状态", "⚠ 电压偏高")
                     else:
                         self._add_result("状态", "✓ 正常")
@@ -226,7 +228,7 @@ class PropertiesPanel(QWidget):
             elif isinstance(item, TrafoItem):
                 self._show_trafo_results(m.uid)
             elif isinstance(item, ImpedanceItem):
-                self._add_result("阻抗结果", "暂未提取")
+                self._show_impedance_results(m.uid)
         elif isinstance(item, ConnectionItem):
             if item.kind == "Line" and item.uid in net.lines:
                 l = net.line_loading_percent.get(item.uid)
@@ -237,6 +239,8 @@ class PropertiesPanel(QWidget):
                 self._add_result("负载率 (%)", f"{l:.1f}" if l is not None else "—")
             elif item.kind == "Trafo" and item.uid in net.trafos:
                 self._show_trafo_results(item.uid)
+            elif item.kind == "Impedance" and item.uid in net.impedances:
+                self._show_impedance_results(item.uid)
 
     def _show_trafo_results(self, uid):
         """变压器潮流结果 (solver 已把 res_trafo 回写到 net.trafo_* 字典)"""
@@ -253,6 +257,20 @@ class PropertiesPanel(QWidget):
         self._add_result(
             "低压侧 P/Q",
             f"{pl:+.2f} / {ql:+.2f}" if pl is not None else "—")
+
+    def _show_impedance_results(self, uid):
+        """串联阻抗潮流结果 (net.impedance_* 字典, solver 回写)"""
+        net = self._scene().network
+        pf = net.impedance_p_from_mw.get(uid)
+        qf = net.impedance_q_from_mvar.get(uid)
+        pt = net.impedance_p_to_mw.get(uid)
+        qt = net.impedance_q_to_mvar.get(uid)
+        self._add_result(
+            "首端 P/Q",
+            f"{pf:+.2f} / {qf:+.2f}" if pf is not None else "—")
+        self._add_result(
+            "末端 P/Q",
+            f"{pt:+.2f} / {qt:+.2f}" if pt is not None else "—")
 
     def _add_result(self, label, value):
         l = QLabel(value)
