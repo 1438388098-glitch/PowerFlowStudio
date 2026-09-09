@@ -34,25 +34,32 @@ class ComponentButton(QPushButton):
 
     def mousePressEvent(self, event):
         if event.button() == Qt.LeftButton:
-            drag = QDrag(self)
-            mime = QMimeData()
-            mime.setData(COMP_MIME, QByteArray(self.KIND.encode("utf-8")))
-            drag.setMimeData(mime)
+            try:
+                drag = QDrag(self)
+                mime = QMimeData()
+                mime.setData(COMP_MIME, QByteArray(self.KIND.encode("utf-8")))
+                drag.setMimeData(mime)
 
-            # Make the drag pixmap show the button itself, with a small
-            # colored square (so users see what's being dragged).
-            pm = QPixmap(self.size())
-            self.render(pm)
-            drag.setPixmap(pm)
-            drag.setHotSpot(QPoint(20, 20))
+                # Make the drag pixmap show the button itself, with a small
+                # colored square (so users see what's being dragged).
+                pm = QPixmap(self.size())
+                self.render(pm)
+                drag.setPixmap(pm)
+                drag.setHotSpot(QPoint(20, 20))
 
-            # Use exec() so we know whether the drag completed; we
-            # don't actually need the return value, but calling exec_
-            # rather than exec_ would block — Qt's exec_ returns
-            # when the drop is finished or cancelled.
-            drag.exec_(Qt.CopyAction)
-            event.accept()
-            return
+                # Use exec_() so we know whether the drag completed; we
+                # don't actually need the return value, but calling exec_
+                # rather than exec_ would block — Qt's exec_ returns
+                # when the drop is finished or cancelled.
+                drag.exec_(Qt.CopyAction)
+                event.accept()
+                return
+            except Exception:
+                import traceback
+                with open("crash.log", "a", encoding="utf-8") as f:
+                    f.write("\n=== palette mousePressEvent exception ===\n")
+                    traceback.print_exc(file=f)
+                # Don't propagate — fall through to default handling.
         super().mousePressEvent(event)
 
 

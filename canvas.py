@@ -384,8 +384,20 @@ class CircuitView(QGraphicsView):
         if not kind:
             event.ignore()
             return
-        scene_pos = self.mapToScene(event.pos())
-        comp = self.scene().add_component(kind, scene_pos.x(), scene_pos.y())
+        try:
+            scene_pos = self.mapToScene(event.pos())
+            x, y = float(scene_pos.x()), float(scene_pos.y())
+            if not (x == x and y == y):  # NaN guard
+                event.ignore()
+                return
+            comp = self.scene().add_component(kind, x, y)
+        except Exception:
+            import traceback
+            with open("crash.log", "a", encoding="utf-8") as f:
+                f.write("\n=== dropEvent exception ===\n")
+                traceback.print_exc(file=f)
+            event.ignore()
+            return
         self.scene().clearSelection()
         if comp is not None:
             comp.setSelected(True)

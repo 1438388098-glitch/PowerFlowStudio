@@ -21,7 +21,7 @@ if errorlevel 1 (
     exit /b 1
 )
 
-echo [1/4] Python version:
+echo [1/5] Python version:
 python --version
 echo.
 
@@ -30,7 +30,7 @@ set HAS_VENV=0
 if exist ".venv\Scripts\python.exe" set HAS_VENV=1
 
 if "%HAS_VENV%"=="0" (
-    echo [2/4] Creating virtual environment .venv ...
+    echo [2/5] Creating virtual environment .venv ...
     python -m venv .venv
     if errorlevel 1 (
         echo [ERROR] Failed to create virtual environment.
@@ -38,12 +38,12 @@ if "%HAS_VENV%"=="0" (
         exit /b 1
     )
 ) else (
-    echo [2/4] Virtual environment already exists, skipping creation.
+    echo [2/5] Virtual environment already exists, skipping creation.
 )
 echo.
 
 REM --- Activate venv and install deps ---
-echo [3/4] Installing dependencies: PyQt5 pyqtgraph pandapower numpy pyinstaller ...
+echo [3/5] Installing dependencies: PyQt5 pyqtgraph pandapower numpy pyinstaller ...
 call .venv\Scripts\activate.bat
 if errorlevel 1 (
     echo [ERROR] Failed to activate virtual environment.
@@ -59,8 +59,18 @@ if errorlevel 1 (
 )
 echo.
 
+REM --- Sanity check the imports before packaging ---
+echo [4/5] Sanity-checking imports ...
+python -c "import PyQt5, pyqtgraph, pandapower, numpy; print('  PyQt5', PyQt5.QtCore.PYQT_VERSION_STR); print('  pyqtgraph', pyqtgraph.__version__); print('  pandapower', pandapower.__version__); print('  numpy', numpy.__version__)"
+if errorlevel 1 (
+    echo [ERROR] Imports failed.
+    pause
+    exit /b 1
+)
+echo.
+
 REM --- Run pyinstaller ---
-echo [4/4] Running pyinstaller (this takes 1-3 minutes on first run) ...
+echo [5/5] Running pyinstaller (this takes 1-3 minutes on first run) ...
 pyinstaller --onefile --windowed --name PowerFlowStudio --noconfirm app.py
 if errorlevel 1 (
     echo [ERROR] pyinstaller failed.
@@ -71,6 +81,7 @@ if errorlevel 1 (
 echo.
 echo === Build complete ===
 echo Output: dist\PowerFlowStudio.exe
+echo.
 echo Double-click it to run, or drag to desktop to make a shortcut.
 pause
 endlocal

@@ -273,6 +273,19 @@ class MainWindow(QMainWindow):
 
 
 def main():
+    # Install a global exception hook so that crashes during GUI events
+    # get written to crash.log instead of vanishing silently on Windows.
+    import traceback
+    def _excepthook(exc_type, exc_value, exc_tb):
+        with open("crash.log", "a", encoding="utf-8") as f:
+            f.write("\n=== Unhandled exception ===\n")
+            f.write("".join(traceback.format_exception(exc_type, exc_value, exc_tb)))
+            f.write("\n")
+        # Also print to stderr so the console window shows it.
+        sys.stderr.write("UNHANDLED EXCEPTION (also written to crash.log):\n")
+        traceback.print_exception(exc_type, exc_value, exc_tb)
+    sys.excepthook = _excepthook
+
     app = QApplication(sys.argv)
     app.setStyle("Fusion")
     w = MainWindow()
