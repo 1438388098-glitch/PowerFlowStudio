@@ -114,6 +114,7 @@ PowerFlowStudio/
 - `Ctrl+R`: 运行潮流
 - `Ctrl+L`: 加载示例
 - `Ctrl+Z` / `Ctrl+Shift+Z`: 撤销 / 重做 (含元件移动)
+- `Ctrl+C` / `Ctrl+V`: 复制 / 粘贴选中元件
 - `Ctrl+N`: 新建 (带未保存确认)
 - `Ctrl+S`: 保存
 - `Ctrl+0`: 适配视图

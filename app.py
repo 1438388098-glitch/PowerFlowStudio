@@ -534,7 +534,6 @@ class MainWindow(QMainWindow):
 
     def _on_result_row_activated(self, kind: str, uid: str):
         """结果总览表点击行 → 画布选中并居中对应元件"""
-        from canvas import BusItem
         if not uid:
             return
         item = self.scene._comp_by_uid.get(uid)
@@ -818,11 +817,15 @@ class MainWindow(QMainWindow):
         self.network.lines.clear()
         self.network.trafos.clear()
         self.network.impedances.clear()
+        self.network.converged = False   # 画布清空后不应残留"已收敛"状态
         self._results_ever_shown = False
         if hasattr(self.scene, "_internal_links"):
             self.scene._internal_links.clear()
+        # 只移除顶层项: scene.items() 含端口/标签等子项, 父项移除时
+        # 子项的 C++ 对象已被一并销毁, 再对子项 removeItem 会访问已释放内存
         for it in list(self.scene.items()):
-            self.scene.removeItem(it)
+            if it.parentItem() is None:
+                self.scene.removeItem(it)
         self.scene._comp_by_uid.clear()
         self.scene._connections.clear()
         self.properties.clear()
@@ -888,8 +891,10 @@ class MainWindow(QMainWindow):
         return True
 
     def _apply_network(self, net: Network) -> None:
-        """用解析好的 Network 替换当前网络并重建画布"""
-        self._clear_canvas()
+        """用解析好的 Network 替换当前网络并重建画布。
+
+        内部批量替换(载入/撤销恢复)不弹清空确认 —— 入口本身已经过用户确认。"""
+        self._clear_canvas(skip_confirm=True)
         self.network.buses.update(net.buses)
         self.network.gens.update(net.gens)
         self.network.loads.update(net.loads)
@@ -1037,7 +1042,6 @@ class MainWindow(QMainWindow):
         self.scene.add_component("Load", 600, 150, "L1")
         self.scene.add_component("Load", 600, 400, "L2")
         # Lines: B1-B2, B1-B3
-        from canvas import ConnectionItem
         b1 = next(it for uid, it in self.scene._comp_by_uid.items()
                   if self.network.buses[uid].name == "B1")
         b2 = next(it for uid, it in self.scene._comp_by_uid.items()
@@ -1094,7 +1098,6 @@ class MainWindow(QMainWindow):
         for uid, it in self.scene._comp_by_uid.items():
             if uid in self.network.buses:
                 b[self.network.buses[uid].name] = it
-        from canvas import ConnectionItem
         for a, b_ in [("B1", "B2"), ("B2", "B3"), ("B3", "B4"), ("B4", "B5")]:
             pa = b[a].port_item("right")
             pb = b[b_].port_item("left")
