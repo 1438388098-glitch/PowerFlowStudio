@@ -30,12 +30,14 @@
 
 | 依赖 | 版本 | 用途 |
 |------|------|------|
-| Python | 3.11+ | 主语言 |
+| Python | 3.11+（建议 3.13，仓库 `.venv` 即 3.13） | 主语言 |
 | PyQt5 | 5.15 | GUI |
-| pyqtgraph | 0.14 | （已装但暂未使用，预留给图表） |
 | pandapower | 3.5 | NR 潮流计算 |
 | numpy | 2.x | pandapower 依赖 |
-| pyinstaller | 6.22 | Windows 打包 |
+| pytest | 8.x | 测试（`tests/` 目录，`python -m pytest tests -q`） |
+| pyinstaller | 6.22 | Windows 打包（仅打包需要） |
+
+> pyqtgraph 曾被列为依赖，但全项目从未 import——已从依赖清单移除，等真做图表再加回来。
 
 ---
 
@@ -48,6 +50,8 @@ PowerFlowStudio/
 ├── palette.py      — 元件库面板 (5 个 QPushButton + QDrag)
 ├── properties.py   — 属性编辑面板 (QFormLayout, 左侧参数 + 右侧潮流结果)
 ├── solver.py       — 拓扑↔pandapower 转换 + Newton-Raphson
+├── tests/          — pytest: test_solver.py(17用例) + test_gui_smoke.py(offscreen)
+├── requirements.txt / requirements-dev.txt — 锁版本依赖
 ├── build_windows.bat  — Windows 一键打包
 └── README.md       — 用户使用说明
 ```
@@ -56,42 +60,45 @@ PowerFlowStudio/
 
 ---
 
-## 三、已知 bug 与待修（按优先级）
+## 三、已知 bug 与待修（按优先级，2026-09-10 复核）
+
+> 复核说明：老清单里 P1#1（vm_pu 不生效）与 P1#3（存取丢 vm_pu）经查证**并不成立**
+> ——属性面板经 `_set_attr` 实时写回 model，`_save_topology` 用 `asdict` 全量序列化，
+> solver 每次运行都读取 `model.vm_pu`。P2#4（改线路参数不生效）同样不成立：
+> `build_pandapower` 创建线路后会把用户的 r/x/c/max_i 覆写回 pandapower 表。
+> 请勿按过时情报返工。
+
+### ✅ 已修复（2026-09-09/10 迭代）
+
+1. ~~变压器结果显示"暂未提取"~~ — 属性面板现在显示负载率与两侧 P/Q（阻抗仍待接，见 P2）
+2. ~~点空白无法取消选中~~ — 点空白 / ESC 均可取消选中，ESC 还能取消正在拖的连线
+3. ~~画布无缩放~~ — 滚轮以光标为锚缩放，工具栏 ⤢ / Ctrl+0 适配视图
+4. ~~结果显示按 name 反查，重名元件结果串位~~ — solver 全程走 uid↔pp_id 映射
+5. ~~画布移动元件位置不回写 model，存/载丢布局~~ — `itemChange` 回写（Bus/Gen/Load）
+6. ~~删除母线留下幽灵图形项~~ — 级联删除挂接的 Gen/Load/Trafo/Impedance 图形项
+7. ~~选中连线属性面板必崩~~ — `_add_float/_add_combo_bus` 显式接收 model
+8. ~~坏 JSON 载入即崩 / 载入后变压器悬空~~ — `parse_topology_json` 先校验后替换，
+   重建时补齐 Bus↔LineComp 连线
+9. ~~删除后再建元件显示名重名~~ — `_next_name` 计数器跳过占用名
+10. ~~变压器自动创建可能 hv==lv 同母线~~ — 创建与校验两处都拦截
 
 ### 🔴 P1 — 修一下体验会好很多
 
-1. **vm_pu 没有真传到 pandapower**
-   - `canvas.py:595` `GenUnit(uid=uid, name=name, bus_uid=bus_uid, p_mw=50, vm_pu=1.0)`
-   - `add_component('Gen', ...)` 写死 `vm_pu=1.0` —— 用户在属性面板改了 vm_pu 也无效
-   - 修：`add_component` 第三个参数应该传 dict 而不是固定值，或者 `GenItem` 持有 default 字段，add 时读 model 字段
-
-2. **变压器 / 阻抗结果在结果面板显示 "暂未提取"**
-   - `properties.py:208-211`
-   - solver 里有 `trafo_loading_percent / trafo_p_hv_mw` 等字典，但 properties 没读
-   - 修：跟 GenItem 的写法一致，加 4-5 行
-
-3. **save/load JSON 时 vm_pu 丢失**
-   - `app.py:177-188` `BusNode(**b)` `GenUnit(**g)` 用 `**` 解包，但用户改了 vm_pu 后没存进 JSON
-   - 看 `app.py:_save_topology` 是否把所有字段都序列化
+1. **阻抗 (Impedance) 结果仍未提取** — `properties.py` 仍显示"暂未提取"，
+   solver 也还没读 `res_impedance`，照 trafo 的写法补即可
 
 ### 🟡 P2 — 锦上添花
 
-4. **线路默认参数是 r=0.4, x=0.4, max_i=0.6 kA**
-   - `solver.py:189-195` `GUI_LINE` std_type
-   - 这是 110 kV 短线路估算值，但用户没法在 UI 里调（除非编辑 properties 后让用户**重新运行潮流**看效果；目前看上去 props 改了不影响 solver——再确认）
-   - 改：让用户能在 properties 调 length_km / r / x / max_i，**并把这些值通过 std_type 传到 pp**——目前用固定 std_type，所以用户改的参数被忽略了
-
-5. **没有 OPF / 短路 / 时域仿真**（仅稳态潮流）— README 已经说明
-6. **没有取消选中的方法**（点空白处应清空 selection）
-7. **撤销/重做**（Ctrl+Z）— 现在没有，UI 操作不可逆
+2. **没有 OPF / 短路 / 时域仿真**（仅稳态潮流）— README 已经说明
+3. **撤销/重做**（Ctrl+Z）— 现在没有，UI 操作不可逆
+4. **Gen/Load 拖线只是视觉装饰** — 拓扑仍由放置时的 bus_uid 决定，界面无提示
 
 ### 🟢 P3 — 大改动 / 长期
 
-8. **没有缩放/平移**（画布小，看大网络困难）—— QGraphicsView 自带 `setDragMode(ScrollHandDrag)` 但要先关 rubber-band selection
-9. **没有对齐网格**（用户拖元件是自由坐标）
-10. **没有复制/粘贴**
-11. **没有 IEEE 标准测试用例库**（IEEE 14/30/57/118 节点 — pandapower 自带但没集成进来）
-12. **没有图表显示**（电压分布、潮流分布、PV 曲线）— pyqtgraph 装好了没用在画图上
+5. **没有对齐网格**（用户拖元件是自由坐标）
+6. **没有复制/粘贴**
+7. **没有 IEEE 标准测试用例库**（IEEE 14/30/57/118 节点 — pandapower 自带但没集成进来）
+8. **没有图表显示**（电压分布、潮流分布、PV 曲线）— pyqtgraph 装好了没用在画图上
 
 ---
 

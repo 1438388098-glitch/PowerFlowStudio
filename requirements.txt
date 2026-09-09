@@ -1,0 +1,5 @@
+# PowerFlowStudio 运行时依赖
+# pandapower 2.x -> 3.x 是破坏性升级, 必须锁版本 (2026-09-10 与 .venv 实测版本一致)
+pandapower==3.5.4
+numpy==2.4.6
+PyQt5==5.15.11

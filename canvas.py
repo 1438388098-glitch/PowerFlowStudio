@@ -43,9 +43,14 @@ V_WARN_HIGH = 1.05
 V_HIGH = 1.10
 
 
+COLOR_BUS_ISOLATED = QColor(205, 205, 205)   # 孤立母线(NaN 电压): 灰
+
+
 def voltage_color(v_pu: Optional[float]) -> QColor:
     if v_pu is None:
         return COLOR_BUS_FILL
+    if v_pu != v_pu:                     # NaN: 未连入电网
+        return COLOR_BUS_ISOLATED
     if v_pu < V_WARN_LOW or v_pu > V_HIGH:
         return QColor(255, 150, 150)   # 严重越限: 红
     if v_pu < V_NORMAL or v_pu > V_WARN_HIGH:
@@ -104,6 +109,8 @@ class BaseComponent(QGraphicsItem):
         self.setFlag(QGraphicsItem.ItemIsMovable, True)
         self.setFlag(QGraphicsItem.ItemIsSelectable, True)
         self.setFlag(QGraphicsItem.ItemSendsScenePositionChanges, True)
+        # ItemSendsGeometryChanges 才能让 itemChange 收到 ItemPositionHasChanged
+        self.setFlag(QGraphicsItem.ItemSendsGeometryChanges, True)
         self._ports: Dict[str, PortItem] = {}
         self._connections: List["ConnectionItem"] = []   # 与本元件相连的所有连线
         if self.HAS_PORTS:
@@ -142,8 +149,17 @@ class BaseComponent(QGraphicsItem):
             self._connections.remove(conn)
 
     def itemChange(self, change, value):
-        # 移动元件时, 同步所有连接线
+        # 移动元件时, 同步所有连接线, 并把位置回写 model
+        # (不回写的话保存/载入会丢掉用户摆好的布局)
+        # 注意: 变压器/阻抗的 model 没有 x/y 字段, 回写前先探测
         if change == QGraphicsItem.ItemPositionHasChanged:
+            if hasattr(self.model, "x"):
+                self.model.x = float(self.pos().x())
+            if hasattr(self.model, "y"):
+                self.model.y = float(self.pos().y())
+            for c in self._connections:
+                c.refresh()
+        elif change == QGraphicsItem.ItemScenePositionHasChanged:
             for c in self._connections:
                 c.refresh()
         return super().itemChange(change, value)
@@ -207,10 +223,12 @@ class BusItem(BaseComponent):
             y = self.H * 0.3 + i * (self.H * 0.2)
             painter.drawLine(QLineF(self.W * 0.15, y, self.W * 0.85, y))
         # 电压数值
-        if v_pu is not None:
-            txt = f"{v_pu:.3f} pu"
-        else:
+        if v_pu is None:
             txt = f"{self.model.vn_kv:.0f} kV"
+        elif v_pu != v_pu:
+            txt = "未连通"          # NaN: 孤立母线
+        else:
+            txt = f"{v_pu:.3f} pu"
         self._v_label.setPlainText(txt)
         br = self._v_label.boundingRect()
         self._v_label.setPos(self.W / 2 - br.width() / 2, -16)
@@ -438,6 +456,34 @@ class CircuitView(QGraphicsView):
         else:
             event.ignore()
 
+    # ---- 缩放 ----
+    ZOOM_MIN = 0.3
+    ZOOM_MAX = 4.0
+    ZOOM_STEP = 1.15
+
+    def wheelEvent(self, event):
+        """滚轮以光标为锚缩放画布(平移仍用中键拖拽)"""
+        angle = event.angleDelta().y()
+        if angle == 0:
+            super().wheelEvent(event)
+            return
+        factor = self.ZOOM_STEP if angle > 0 else 1.0 / self.ZOOM_STEP
+        cur = self.transform().m11()
+        if not (self.ZOOM_MIN <= cur * factor <= self.ZOOM_MAX):
+            return
+        anchor = self.transformationAnchor()
+        self.setTransformationAnchor(QGraphicsView.AnchorUnderMouse)
+        self.scale(factor, factor)
+        self.setTransformationAnchor(anchor)
+
+    def fit_view(self):
+        """缩放到正好看到全部元件"""
+        if self.scene() is None or not self.scene().items():
+            self.resetTransform()
+            return
+        rect = self.scene().itemsBoundingRect().adjusted(-60, -60, 60, 60)
+        self.fitInView(rect, Qt.KeepAspectRatio)
+
     # ---- Mouse interaction ----
     def mousePressEvent(self, event):
         # Left-click on a port -> start drawing a connection
@@ -450,6 +496,9 @@ class CircuitView(QGraphicsView):
                 self._start_connection_from_port(item, event)
                 event.accept()
                 return
+            if item is None:
+                # 点空白处: 取消选中 (否则选中状态没有取消途径)
+                self.scene().clearSelection()
         super().mousePressEvent(event)
 
     def _start_connection_from_port(self, port, event):
@@ -532,6 +581,18 @@ class CircuitView(QGraphicsView):
         return item
 
     def keyPressEvent(self, event):
+        # ESC: 正在拖连线则取消拖拽, 否则取消选中
+        if event.key() == Qt.Key_Escape:
+            if self._pending_port and self._rubber_line:
+                self.scene().removeItem(self._rubber_line)
+                self._rubber_line = None
+                self._pending_port = None
+                event.accept()
+                return
+            if self.scene().selectedItems():
+                self.scene().clearSelection()
+                event.accept()
+                return
         # Delete / Backspace deletes the selection
         if event.key() in (Qt.Key_Delete, Qt.Key_Backspace):
             for it in list(self.scene().selectedItems()):
@@ -562,6 +623,7 @@ class CircuitScene(QGraphicsScene):
         self.setSceneRect(0, 0, 2000, 1400)
         self._comp_by_uid: Dict[str, BaseComponent] = {}
         self._connections: List[ConnectionItem] = []
+        self._name_seq: Dict[str, int] = {}   # 显示名计数器, 按 prefix 分池
         self.selection_changed_handler = None
         self._view = None  # set by set_view() after construction
 
@@ -579,15 +641,31 @@ class CircuitScene(QGraphicsScene):
                 win.status.showMessage(f"已创建 {kind}  {name}", 3000)
 
     # ------- 元件创建 / 删除 -------
+    def _next_name(self, prefix: str, container: dict, seq_key: Optional[str] = None) -> str:
+        """生成不与 container 内现有显示名冲突的 prefix+N。
+
+        不能用 len(container)+1: 删除元件后再建会与现存元件重名,
+        例如建 L1、L2, 删 L1, 再建一条会再次叫 L2。
+        """
+        key = seq_key or prefix
+        used = {m.name for m in container.values()}
+        n = self._name_seq.get(key, 0)
+        while True:
+            n += 1
+            candidate = f"{prefix}{n}"
+            if candidate not in used:
+                self._name_seq[key] = n
+                return candidate
+
     def add_component(self, kind: str, x: float, y: float, name: Optional[str] = None):
         uid = uuid.uuid4().hex[:8]
         if kind == "Bus":
-            name = name or f"B{len(self.network.buses)+1}"
+            name = name or self._next_name("B", self.network.buses)
             model = BusNode(uid=uid, name=name, x=x, y=y, vn_kv=110.0)
             self.network.buses[uid] = model
             item = BusItem(model)
         elif kind == "Gen":
-            name = name or f"G{len(self.network.gens)+1}"
+            name = name or self._next_name("G", self.network.gens)
             # 默认挂到最近母线
             bus_uid = self._nearest_bus(x, y)
             if bus_uid is None:
@@ -596,7 +674,7 @@ class CircuitScene(QGraphicsScene):
             self.network.gens[uid] = model
             item = GenItem(model)
         elif kind == "Load":
-            name = name or f"L{len(self.network.loads)+1}"
+            name = name or self._next_name("L", self.network.loads)
             bus_uid = self._nearest_bus(x, y)
             if bus_uid is None:
                 bus_uid = self._ensure_first_bus(x, y)
@@ -604,10 +682,10 @@ class CircuitScene(QGraphicsScene):
             self.network.loads[uid] = model
             item = LoadItem(model)
         elif kind == "Trafo":
-            name = name or f"T{len(self.network.trafos)+1}"
+            name = name or self._next_name("T", self.network.trafos)
             uid_a = self._nearest_bus(x, y - 30)
             uid_b = self._nearest_bus(x, y + 30)
-            if uid_a is None or uid_b is None:
+            if uid_a is None or uid_b is None or uid_a == uid_b:
                 a, b = self._ensure_two_buses(x, y)
                 uid_a, uid_b = a, b
             model = TrafoBranch(
@@ -617,10 +695,10 @@ class CircuitScene(QGraphicsScene):
             self.network.trafos[uid] = model
             item = TrafoItem(model)
         elif kind == "Impedance":
-            name = name or f"Z{len(self.network.impedances)+1}"
+            name = name or self._next_name("Z", self.network.impedances)
             uid_a = self._nearest_bus(x, y - 30)
             uid_b = self._nearest_bus(x, y + 30)
-            if uid_a is None or uid_b is None:
+            if uid_a is None or uid_b is None or uid_a == uid_b:
                 a, b = self._ensure_two_buses(x, y)
                 uid_a, uid_b = a, b
             model = ImpedanceBranch(
@@ -643,11 +721,13 @@ class CircuitScene(QGraphicsScene):
 
     def _ensure_first_bus(self, x, y):
         # 没有任何母线时自动建一个
-        return self.add_component("Bus", x, y, name="B1").model.uid
+        return self.add_component("Bus", x, y).model.uid
 
     def _ensure_two_buses(self, x, y):
-        a = self.add_component("Bus", x - 30, y - 30, name=f"B{len(self.network.buses)+1}").model.uid
-        b = self.add_component("Bus", x + 30, y + 30, name=f"B{len(self.network.buses)+1}").model.uid
+        a = self.add_component("Bus", x - 30, y - 30).model.uid
+        b = self.add_component("Bus", x + 30, y + 30).model.uid
+        if a == b:   # 两次都吸附到了同一条母线: 强制新建一条
+            b = self.add_component("Bus", x + 60, y + 30).model.uid
         return a, b
 
     def _nearest_bus(self, x, y, max_dist=200):
@@ -681,7 +761,7 @@ class CircuitScene(QGraphicsScene):
         if isinstance(a_item, BusItem) and isinstance(b_item, BusItem):
             uid = uuid.uuid4().hex[:8]
             model = LineBranch(
-                uid=uid, name=f"L{len(self.network.lines)+1}",
+                uid=uid, name=self._next_name("L", self.network.lines, seq_key="Line"),
                 from_bus=a_item.model.uid, to_bus=b_item.model.uid
             )
             self.network.lines[uid] = model
@@ -695,37 +775,21 @@ class CircuitScene(QGraphicsScene):
                 model.from_bus, model.to_bus = model.to_bus, model.from_bus
                 conn.a_port, conn.b_port = conn.b_port, conn.a_port
                 conn.a_comp, conn.b_comp = conn.b_comp, conn.a_comp
-        # 母线 ↔ LineComp(变压器/阻抗) 视为连接到 LineComp 的一端, 不建新数据, 但记录端口映射
+        # 母线 ↔ LineComp(变压器/阻抗): 把母线 uid 固化到 LineComp 的对应字段
         elif isinstance(a_item, BusItem) and isinstance(b_item, LineCompItem):
-            a_item.model.uid  # 母线 uid
-            # 这种端口连接只是把"哪端挂到哪条母线"信息固化下来
             comp = b_item
-            # 左端 p1 -> hv, 右端 p2 -> lv (trafo) / from(imp)
-            if a_port.port_id == "p1" or a_port.port_id == "left" or a_port.port_id == "top":
-                # 母线接到了 comp 的左侧/上方
-                # 直接通过端口位置判断: a 在 comp 左边就接到 comp 的 p1 端口
-                # 我们把母线 uid 写进 model 字段
-                if isinstance(comp, TrafoItem):
-                    if a_port.scenePos().x() < comp.scenePos().x() + comp.W / 2:
-                        comp.model.hv_bus = a_item.model.uid
-                    else:
-                        comp.model.lv_bus = a_item.model.uid
+            # 按母线相对 LineComp 的位置决定接哪一端: 左半边接 hv/from, 右半边接 lv/to
+            bus_on_left = a_port.scenePos().x() < comp.scenePos().x() + comp.W / 2
+            if isinstance(comp, TrafoItem):
+                if bus_on_left:
+                    comp.model.hv_bus = a_item.model.uid
                 else:
-                    if a_port.scenePos().x() < comp.scenePos().x() + comp.W / 2:
-                        comp.model.from_bus = a_item.model.uid
-                    else:
-                        comp.model.to_bus = a_item.model.uid
+                    comp.model.lv_bus = a_item.model.uid
             else:
-                if isinstance(comp, TrafoItem):
-                    if a_port.scenePos().x() < comp.scenePos().x() + comp.W / 2:
-                        comp.model.hv_bus = a_item.model.uid
-                    else:
-                        comp.model.lv_bus = a_item.model.uid
+                if bus_on_left:
+                    comp.model.from_bus = a_item.model.uid
                 else:
-                    if a_port.scenePos().x() < comp.scenePos().x() + comp.W / 2:
-                        comp.model.from_bus = a_item.model.uid
-                    else:
-                        comp.model.to_bus = a_item.model.uid
+                    comp.model.to_bus = a_item.model.uid
             conn = ConnectionItem(a_item, a_port, b_item, b_port)
             conn.kind = "Trafo" if isinstance(b_item, TrafoItem) else "Impedance"
             conn.uid = b_item.model.uid
@@ -780,14 +844,12 @@ class CircuitScene(QGraphicsScene):
             # 从 network 删
             if kind == "Bus":
                 self.network.buses.pop(uid, None)
-                # 关联到这个母线的 gen/load 也要删
+                # 挂接在这个母线上的 gen/load: model 和图形项一起删
                 if hasattr(self, "_internal_links") and uid in self._internal_links:
-                    for child_uid in self._internal_links[uid]:
-                        for d in (self.network.gens, self.network.loads, self.network.trafos, self.network.impedances):
-                            if child_uid in d:
-                                d.pop(child_uid)
-                                break
-                # 关联到这个母线的线路/变压器/阻抗也要删
+                    for child_uid in list(self._internal_links[uid]):
+                        self._remove_component(child_uid)
+                    self._internal_links.pop(uid, None)
+                # 以该母线为端点的线路/变压器/阻抗: model 和图形项一起删
                 self._purge_branches_on_bus(uid)
             elif kind == "Gen":
                 self.network.gens.pop(uid, None)
@@ -824,6 +886,33 @@ class CircuitScene(QGraphicsScene):
             if item in self._connections:
                 self._connections.remove(item)
 
+    def _remove_component(self, comp_uid: str):
+        """删掉一个挂接元件(gen/load/trafo/imp): model 与图形项一起清理。
+
+        只删 model 不删图形项会留下"幽灵元件"——还能选中/编辑,
+        却不参与计算, 保存后凭空消失。
+        """
+        for d in (self.network.gens, self.network.loads,
+                  self.network.trafos, self.network.impedances):
+            if comp_uid in d:
+                d.pop(comp_uid)
+                break
+        item = self._comp_by_uid.pop(comp_uid, None)
+        if item is not None:
+            self._detach_item_connections(item)
+            self.removeItem(item)
+
+    def _detach_item_connections(self, item):
+        """把挂在 item 上的所有连线从场景、对端元件、_connections 里摘除"""
+        for c in list(item._connections):
+            other = c.b_comp if c.a_comp is item else c.a_comp
+            other.unregister_connection(c)
+            if c in self._connections:
+                self._connections.remove(c)
+            if c.scene() is not None:
+                self.removeItem(c)
+        item._connections.clear()
+
     def _purge_branches_on_bus(self, bus_uid):
         for d in (self.network.lines, self.network.trafos, self.network.impedances):
             to_del = [uid for uid, br in d.items()
@@ -833,6 +922,9 @@ class CircuitScene(QGraphicsScene):
                           getattr(br, "lv_bus", "") == bus_uid)]
             for uid in to_del:
                 d.pop(uid, None)
+                # 变压器/阻抗有图形项, 一并清掉; 线路没有独立图形项
+                if uid in self._comp_by_uid:
+                    self._remove_component(uid)
 
     # ------- 结果可视化刷新 -------
     def refresh_results(self):

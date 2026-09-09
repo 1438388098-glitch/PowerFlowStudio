@@ -61,43 +61,35 @@ class PropertiesPanel(QWidget):
 
         if kind == "Bus":
             self._add_name_field()
-            self._add_float("vn_kv", "额定电压 (kV)", model.vn_kv, 0.1, 1000, 1)
+            self._add_float(model, "vn_kv", "额定电压 (kV)", model.vn_kv, 0.1, 1000, 1)
         elif kind == "Gen":
             self._add_name_field()
-            self._add_combo_bus("bus_uid", "挂接母线", model.bus_uid)
-            self._add_float("p_mw", "有功 P (MW)", model.p_mw, 0, 5000, 1)
-            self._add_float("vm_pu", "电压 V (pu)", model.vm_pu, 0.8, 1.2, 4)
+            self._add_combo_bus(model, "bus_uid", "挂接母线", model.bus_uid)
+            self._add_float(model, "p_mw", "有功 P (MW)", model.p_mw, 0, 5000, 1)
+            self._add_float(model, "vm_pu", "电压 V (pu)", model.vm_pu, 0.8, 1.2, 4)
         elif kind == "Load":
             self._add_name_field()
-            self._add_combo_bus("bus_uid", "挂接母线", model.bus_uid)
-            self._add_float("p_mw", "有功 P (MW)", model.p_mw, 0, 5000, 1)
-            self._add_float("q_mvar", "无功 Q (Mvar)", model.q_mvar, -1000, 1000, 2)
+            self._add_combo_bus(model, "bus_uid", "挂接母线", model.bus_uid)
+            self._add_float(model, "p_mw", "有功 P (MW)", model.p_mw, 0, 5000, 1)
+            self._add_float(model, "q_mvar", "无功 Q (Mvar)", model.q_mvar, -1000, 1000, 2)
         elif kind == "Trafo":
             self._add_name_field()
-            self._add_combo_bus("hv_bus", "高压母线", model.hv_bus)
-            self._add_combo_bus("lv_bus", "低压母线", model.lv_bus)
-            self._add_float("sn_mva", "额定容量 (MVA)", model.sn_mva, 0.1, 1000, 1)
-            self._add_float("vn_hv_kv", "高压侧额定电压 (kV)", model.vn_hv_kv, 0.1, 1000, 1)
-            self._add_float("vn_lv_kv", "低压侧额定电压 (kV)", model.vn_lv_kv, 0.1, 1000, 1)
-            self._add_float("vk_percent", "短路电压 (%)", model.vk_percent, 0, 30, 2)
-            self._add_float("vkr_percent", "电阻压降 (%)", model.vkr_percent, 0, 30, 3)
-            self._add_float("pfe_kw", "铁损 (kW)", model.pfe_kw, 0, 1000, 1)
-            self._add_float("i0_percent", "空载电流 (%)", model.i0_percent, 0, 10, 3)
+            self._add_combo_bus(model, "hv_bus", "高压母线", model.hv_bus)
+            self._add_combo_bus(model, "lv_bus", "低压母线", model.lv_bus)
+            self._add_float(model, "sn_mva", "额定容量 (MVA)", model.sn_mva, 0.1, 1000, 1)
+            self._add_float(model, "vn_hv_kv", "高压侧额定电压 (kV)", model.vn_hv_kv, 0.1, 1000, 1)
+            self._add_float(model, "vn_lv_kv", "低压侧额定电压 (kV)", model.vn_lv_kv, 0.1, 1000, 1)
+            self._add_float(model, "vk_percent", "短路电压 (%)", model.vk_percent, 0, 30, 2)
+            self._add_float(model, "vkr_percent", "电阻压降 (%)", model.vkr_percent, 0, 30, 3)
+            self._add_float(model, "pfe_kw", "铁损 (kW)", model.pfe_kw, 0, 1000, 1)
+            self._add_float(model, "i0_percent", "空载电流 (%)", model.i0_percent, 0, 10, 3)
         elif kind == "Impedance":
             self._add_name_field()
-            self._add_combo_bus("from_bus", "首端母线", model.from_bus)
-            self._add_combo_bus("to_bus", "末端母线", model.to_bus)
-            self._add_float("rft_pu", "R (pu)", model.rft_pu, -10, 10, 4)
-            self._add_float("xft_pu", "X (pu)", model.xft_pu, -10, 10, 4)
-            self._add_float("sn_mva", "基准容量 (MVA)", model.sn_mva, 0.1, 1000, 1)
-        elif kind == "Line":
-            self._add_name_field()
-            self._add_combo_bus("from_bus", "首端母线", model.from_bus)
-            self._add_combo_bus("to_bus", "末端母线", model.to_bus)
-            self._add_float("length_km", "长度 (km)", model.length_km, 0.01, 1000, 2)
-            self._add_float("r_ohm_per_km", "R (Ω/km)", model.r_ohm_per_km, 0, 10, 4)
-            self._add_float("x_ohm_per_km", "X (Ω/km)", model.x_ohm_per_km, 0, 10, 4)
-            self._add_float("max_i_ka", "载流量 (kA)", model.max_i_ka, 0, 10, 3)
+            self._add_combo_bus(model, "from_bus", "首端母线", model.from_bus)
+            self._add_combo_bus(model, "to_bus", "末端母线", model.to_bus)
+            self._add_float(model, "rft_pu", "R (pu)", model.rft_pu, -10, 10, 4)
+            self._add_float(model, "xft_pu", "X (pu)", model.xft_pu, -10, 10, 4)
+            self._add_float(model, "sn_mva", "基准容量 (MVA)", model.sn_mva, 0.1, 1000, 1)
 
         self.refresh_results()
 
@@ -120,12 +112,12 @@ class PropertiesPanel(QWidget):
 
     def _show_line_form(self, model):
         self._add_name_field_line(model)
-        self._add_combo_bus("from_bus", "首端母线", model.from_bus)
-        self._add_combo_bus("to_bus", "末端母线", model.to_bus)
-        self._add_float("length_km", "长度 (km)", model.length_km, 0.01, 1000, 2)
-        self._add_float("r_ohm_per_km", "R (Ω/km)", model.r_ohm_per_km, 0, 10, 4)
-        self._add_float("x_ohm_per_km", "X (Ω/km)", model.x_ohm_per_km, 0, 10, 4)
-        self._add_float("max_i_ka", "载流量 (kA)", model.max_i_ka, 0, 10, 3)
+        self._add_combo_bus(model, "from_bus", "首端母线", model.from_bus)
+        self._add_combo_bus(model, "to_bus", "末端母线", model.to_bus)
+        self._add_float(model, "length_km", "长度 (km)", model.length_km, 0.01, 1000, 2)
+        self._add_float(model, "r_ohm_per_km", "R (Ω/km)", model.r_ohm_per_km, 0, 10, 4)
+        self._add_float(model, "x_ohm_per_km", "X (Ω/km)", model.x_ohm_per_km, 0, 10, 4)
+        self._add_float(model, "max_i_ka", "载流量 (kA)", model.max_i_ka, 0, 10, 3)
 
     def _add_name_field_line(self, model):
         e = QLineEdit(model.name)
@@ -153,18 +145,17 @@ class PropertiesPanel(QWidget):
         ))
         self.form_layout.addRow("名称", e)
 
-    def _add_float(self, attr, label, value, mn, mx, decimals):
+    def _add_float(self, model, attr, label, value, mn, mx, decimals):
         sb = QDoubleSpinBox()
         sb.setDecimals(decimals)
         sb.setRange(mn, mx)
         sb.setSingleStep(0.01 if mx - mn < 10 else 1.0)
         sb.setValue(value)
-        model = self.current_item.model
         sb.valueChanged.connect(lambda v: self._set_attr(model, attr, v))
         self.form_layout.addRow(label, sb)
         self._fields[attr] = sb
 
-    def _add_combo_bus(self, attr, label, current_uid):
+    def _add_combo_bus(self, model, attr, label, current_uid):
         from PyQt5.QtWidgets import QComboBox
         cb = QComboBox()
         scene = self._scene()
@@ -174,7 +165,6 @@ class PropertiesPanel(QWidget):
         idx = cb.findData(current_uid)
         if idx >= 0:
             cb.setCurrentIndex(idx)
-        model = self.current_item.model
         cb.currentIndexChanged.connect(
             lambda i: self._set_attr(model, attr, cb.itemData(i))
         )
@@ -234,7 +224,7 @@ class PropertiesPanel(QWidget):
                 self._add_result("母线电压 (pu)", f"{v:.4f}" if v is not None else "—")
                 self._add_result("母线相角 (°)", f"{a:.3f}" if a is not None else "—")
             elif isinstance(item, TrafoItem):
-                self._add_result("变压器结果", "暂未提取 (仅作连线占位)")
+                self._show_trafo_results(m.uid)
             elif isinstance(item, ImpedanceItem):
                 self._add_result("阻抗结果", "暂未提取")
         elif isinstance(item, ConnectionItem):
@@ -246,7 +236,23 @@ class PropertiesPanel(QWidget):
                 self._add_result("首端 Q (Mvar)", f"{q:.2f}" if q is not None else "—")
                 self._add_result("负载率 (%)", f"{l:.1f}" if l is not None else "—")
             elif item.kind == "Trafo" and item.uid in net.trafos:
-                self._add_result("变压器结果", "暂未提取 (仅作连线占位)")
+                self._show_trafo_results(item.uid)
+
+    def _show_trafo_results(self, uid):
+        """变压器潮流结果 (solver 已把 res_trafo 回写到 net.trafo_* 字典)"""
+        net = self._scene().network
+        l = net.trafo_loading_percent.get(uid)
+        ph = net.trafo_p_hv_mw.get(uid)
+        qh = net.trafo_q_hv_mvar.get(uid)
+        pl = net.trafo_p_lv_mw.get(uid)
+        ql = net.trafo_q_lv_mvar.get(uid)
+        self._add_result("负载率 (%)", f"{l:.1f}" if l is not None else "—")
+        self._add_result(
+            "高压侧 P/Q",
+            f"{ph:+.2f} / {qh:+.2f}" if ph is not None else "—")
+        self._add_result(
+            "低压侧 P/Q",
+            f"{pl:+.2f} / {ql:+.2f}" if pl is not None else "—")
 
     def _add_result(self, label, value):
         l = QLabel(value)

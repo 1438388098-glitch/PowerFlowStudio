@@ -7,7 +7,10 @@ canvas (handled in canvas.py: CircuitView.dropEvent). The MainWindow
 only wires signals and owns the Network.
 """
 from __future__ import annotations
+import json
 import sys
+import time
+from dataclasses import asdict, fields as dc_fields
 
 from PyQt5.QtCore import Qt
 from PyQt5.QtGui import QKeySequence
@@ -16,10 +19,83 @@ from PyQt5.QtWidgets import (
     QStatusBar, QShortcut, QToolBar, QFileDialog
 )
 
-from solver import Network, run_power_flow
+from solver import (
+    Network, run_power_flow,
+    BusNode, GenUnit, LoadUnit, LineBranch, TrafoBranch, ImpedanceBranch,
+)
 from canvas import CircuitScene, CircuitView, BaseComponent, ConnectionItem
 from palette import ComponentPalette
 from properties import PropertiesPanel
+
+
+# -------------------------------------------------------------
+# 拓扑 JSON 解析/校验(独立于 GUI, 方便测试)
+# -------------------------------------------------------------
+_TOPO_SPEC = [
+    ("buses", BusNode), ("gens", GenUnit), ("loads", LoadUnit),
+    ("lines", LineBranch), ("trafos", TrafoBranch),
+    ("impedances", ImpedanceBranch),
+]
+
+
+def parse_topology_json(data) -> Network:
+    """把 json.load 出来的 dict 解析成 Network, 带字段与引用校验。
+
+    旧版本直接 BusNode(**b): 多余/缺失键 TypeError、悬空 bus_uid
+    KeyError, 都发生在清空画布之后, 用户面临"存得进读不出"。
+    这里提前解析+校验, 坏文件以可读报错拒绝, 不动当前画布。
+    """
+    if not isinstance(data, dict):
+        raise ValueError("顶层必须是 JSON 对象")
+    net = Network()
+    for key, cls in _TOPO_SPEC:
+        entries = data.get(key, []) or []
+        if not isinstance(entries, list):
+            raise ValueError(f"'{key}' 必须是数组")
+        allowed = {f.name for f in dc_fields(cls)}
+        for entry in entries:
+            if not isinstance(entry, dict):
+                raise ValueError(f"'{key}' 里存在非对象条目: {entry!r}")
+            if "uid" not in entry or "name" not in entry:
+                raise ValueError(f"'{key}' 条目缺少 uid/name: {entry!r}")
+            kwargs = {k: v for k, v in entry.items() if k in allowed}
+            try:
+                obj = cls(**kwargs)
+            except TypeError as e:
+                raise ValueError(
+                    f"'{key}' 条目 {entry.get('name', '?')} 字段无效: {e}")
+            getattr(net, key)[obj.uid] = obj
+    bus_uids = set(net.buses)
+
+    def _check_ref(ref, what, name):
+        if ref not in bus_uids:
+            raise ValueError(f"{what} '{name}' 引用了不存在的母线: {ref!r}")
+
+    for g in net.gens.values():
+        _check_ref(g.bus_uid, "发电机", g.name)
+    for ld in net.loads.values():
+        _check_ref(ld.bus_uid, "负荷", ld.name)
+    for ln in net.lines.values():
+        _check_ref(ln.from_bus, "线路", ln.name)
+        _check_ref(ln.to_bus, "线路", ln.name)
+    for tr in net.trafos.values():
+        _check_ref(tr.hv_bus, "变压器", tr.name)
+        _check_ref(tr.lv_bus, "变压器", tr.name)
+    for im in net.impedances.values():
+        _check_ref(im.from_bus, "阻抗", im.name)
+        _check_ref(im.to_bus, "阻抗", im.name)
+    return net
+
+
+def network_to_json_dict(net: Network) -> dict:
+    return {
+        "buses": [asdict(b) for b in net.buses.values()],
+        "gens": [asdict(g) for g in net.gens.values()],
+        "loads": [asdict(l) for l in net.loads.values()],
+        "lines": [asdict(l) for l in net.lines.values()],
+        "trafos": [asdict(t) for t in net.trafos.values()],
+        "impedances": [asdict(i) for i in net.impedances.values()],
+    }
 
 
 class MainWindow(QMainWindow):
@@ -75,6 +151,10 @@ class MainWindow(QMainWindow):
         act_load = QAction("📂 载入拓扑", self)
         act_load.triggered.connect(self._load_topology)
         toolbar.addAction(act_load)
+        toolbar.addSeparator()
+        act_fit = QAction("⤢ 适配视图", self)
+        act_fit.triggered.connect(self.view.fit_view)
+        toolbar.addAction(act_fit)
 
         # Status bar
         self.status = QStatusBar()
@@ -84,6 +164,7 @@ class MainWindow(QMainWindow):
         # Shortcuts
         QShortcut(QKeySequence("Ctrl+R"), self, activated=self._run_power_flow)
         QShortcut(QKeySequence("Ctrl+L"), self, activated=self._load_demo)
+        QShortcut(QKeySequence("Ctrl+0"), self, activated=self.view.fit_view)
 
     # ---------- Selection ----------
     def _on_selection_changed(self):
@@ -99,7 +180,9 @@ class MainWindow(QMainWindow):
 
     # ---------- Toolbar actions ----------
     def _run_power_flow(self):
+        t0 = time.perf_counter()
         ok, err = run_power_flow(self.network)
+        elapsed_ms = (time.perf_counter() - t0) * 1000.0
         if not ok:
             if self.isVisible():
                 QMessageBox.warning(self, "潮流计算失败", err)
@@ -111,7 +194,8 @@ class MainWindow(QMainWindow):
         n_bus = len(self.network.buses)
         n_line = len(self.network.lines)
         self.status.showMessage(
-            f"✅ Converged — buses {n_bus}, lines {n_line}", 5000
+            f"✅ 收敛 — 母线 {n_bus}, 线路 {n_line}, 耗时 {elapsed_ms:.0f} ms",
+            5000,
         )
         return True, ""
 
@@ -142,56 +226,52 @@ class MainWindow(QMainWindow):
         self.properties.clear()
         self.status.showMessage("画布已清空", 2000)
 
-    def _save_topology(self):
-        path, _ = QFileDialog.getSaveFileName(
-            self, "保存拓扑", "topology.json", "JSON (*.json)"
-        )
-        if not path:
-            return
-        import json
-        from dataclasses import asdict
-        data = {
-            "buses": [asdict(b) for b in self.network.buses.values()],
-            "gens": [asdict(g) for g in self.network.gens.values()],
-            "loads": [asdict(l) for l in self.network.loads.values()],
-            "lines": [asdict(l) for l in self.network.lines.values()],
-            "trafos": [asdict(t) for t in self.network.trafos.values()],
-            "impedances": [asdict(i) for i in self.network.impedances.values()],
-        }
+    def _save_topology(self, path=None):
+        if path is None:
+            path, _ = QFileDialog.getSaveFileName(
+                self, "保存拓扑", "topology.json", "JSON (*.json)"
+            )
+            if not path:
+                return None
+        data = network_to_json_dict(self.network)
         with open(path, "w", encoding="utf-8") as f:
             json.dump(data, f, ensure_ascii=False, indent=2)
         self.status.showMessage(f"已保存到 {path}", 4000)
+        return path
 
-    def _load_topology(self):
-        path, _ = QFileDialog.getOpenFileName(
-            self, "载入拓扑", "", "JSON (*.json)"
-        )
-        if not path:
-            return
-        import json
+    def _load_topology(self, path=None):
+        if path is None:
+            path, _ = QFileDialog.getOpenFileName(
+                self, "载入拓扑", "", "JSON (*.json)"
+            )
+            if not path:
+                return False
         try:
             with open(path, "r", encoding="utf-8") as f:
                 data = json.load(f)
         except Exception as e:
             QMessageBox.warning(self, "载入失败", f"无法读取文件: {e}")
-            return
-        self._clear_canvas()
-        from solver import BusNode, GenUnit, LoadUnit, LineBranch, TrafoBranch, ImpedanceBranch
-        for b in data.get("buses", []):
-            self.network.buses[b["uid"]] = BusNode(**b)
-        for g in data.get("gens", []):
-            self.network.gens[g["uid"]] = GenUnit(**g)
-        for l in data.get("loads", []):
-            self.network.loads[l["uid"]] = LoadUnit(**l)
-        for l in data.get("lines", []):
-            self.network.lines[l["uid"]] = LineBranch(**l)
-        for t in data.get("trafos", []):
-            self.network.trafos[t["uid"]] = TrafoBranch(**t)
-        for i in data.get("impedances", []):
-            self.network.impedances[i["uid"]] = ImpedanceBranch(**i)
-        # Rebuild canvas
-        self._rebuild_scene_from_network()
+            return False
+        # 先解析校验, 通过了才动当前画布(坏文件不能毁掉已画的内容)
+        try:
+            net = parse_topology_json(data)
+        except Exception as e:
+            QMessageBox.warning(self, "载入失败", f"拓扑数据无效: {e}")
+            return False
+        self._apply_network(net)
         self.status.showMessage(f"已载入 {path}", 4000)
+        return True
+
+    def _apply_network(self, net: Network):
+        """用解析好的 Network 替换当前网络并重建画布"""
+        self._clear_canvas()
+        self.network.buses.update(net.buses)
+        self.network.gens.update(net.gens)
+        self.network.loads.update(net.loads)
+        self.network.lines.update(net.lines)
+        self.network.trafos.update(net.trafos)
+        self.network.impedances.update(net.impedances)
+        self._rebuild_scene_from_network()
 
     def _rebuild_scene_from_network(self):
         from canvas import BusItem, GenItem, LoadItem, TrafoItem, ImpedanceItem, ConnectionItem
@@ -204,14 +284,21 @@ class MainWindow(QMainWindow):
         for uid, g in self.network.gens.items():
             it = GenItem(g)
             bus = self.network.buses[g.bus_uid]
-            it.setPos(bus.x + 20, bus.y - 80)
+            # 优先用保存的画布坐标; 老文件(坐标为 0,0)退回母线旁固定偏移
+            if g.x or g.y:
+                it.setPos(g.x, g.y)
+            else:
+                it.setPos(bus.x + 20, bus.y - 80)
             self.scene.addItem(it)
             self.scene._comp_by_uid[uid] = it
             self.scene._register_internal_link(it, g.bus_uid)
         for uid, l in self.network.loads.items():
             it = LoadItem(l)
             bus = self.network.buses[l.bus_uid]
-            it.setPos(bus.x + 80, bus.y - 80)
+            if l.x or l.y:
+                it.setPos(l.x, l.y)
+            else:
+                it.setPos(bus.x + 80, bus.y - 80)
             self.scene.addItem(it)
             self.scene._comp_by_uid[uid] = it
             self.scene._register_internal_link(it, l.bus_uid)
@@ -229,6 +316,19 @@ class MainWindow(QMainWindow):
             it.setPos((a.x + b.x) / 2 - 40, (a.y + b.y) / 2 - 25)
             self.scene.addItem(it)
             self.scene._comp_by_uid[uid] = it
+        # 变压器/阻抗与母线之间的连线(之前载入后悬空漂浮, 看不出接在哪儿)
+        for uid, t in self.network.trafos.items():
+            comp = self.scene._comp_by_uid.get(uid)
+            for bus_uid in (t.hv_bus, t.lv_bus):
+                bus_item = self.scene._comp_by_uid.get(bus_uid)
+                if comp is not None and bus_item is not None:
+                    self._reconnect_bus_to_linecomp(bus_item, comp)
+        for uid, im in self.network.impedances.items():
+            comp = self.scene._comp_by_uid.get(uid)
+            for bus_uid in (im.from_bus, im.to_bus):
+                bus_item = self.scene._comp_by_uid.get(bus_uid)
+                if comp is not None and bus_item is not None:
+                    self._reconnect_bus_to_linecomp(bus_item, comp)
         # Lines between buses
         for uid, ln in self.network.lines.items():
             a = self.scene._comp_by_uid.get(ln.from_bus)
@@ -246,6 +346,22 @@ class MainWindow(QMainWindow):
             b.register_connection(conn)
             self.scene.addItem(conn)
             self.scene._connections.append(conn)
+
+    def _reconnect_bus_to_linecomp(self, bus_item, comp_item):
+        """重建一条 母线↔变压器/阻抗 的可视化连线(不改动拓扑字段)"""
+        from canvas import TrafoItem
+        bus_left = bus_item.scenePos().x() <= comp_item.scenePos().x()
+        port_bus = bus_item.port_item("right" if bus_left else "left")
+        port_comp = comp_item.port_item("p1" if bus_left else "p2")
+        if port_bus is None or port_comp is None:
+            return
+        conn = ConnectionItem(bus_item, port_bus, comp_item, port_comp)
+        conn.kind = "Trafo" if isinstance(comp_item, TrafoItem) else "Impedance"
+        conn.uid = comp_item.model.uid
+        bus_item.register_connection(conn)
+        comp_item.register_connection(conn)
+        self.scene.addItem(conn)
+        self.scene._connections.append(conn)
 
     def _load_demo(self):
         """Load a 3-bus demo: B1(gen)--B2(load1)--B3(load2)."""
@@ -292,12 +408,17 @@ class MainWindow(QMainWindow):
         self.scene.add_component("Bus", 550, 300, "B3")
         self.scene.add_component("Bus", 750, 300, "B4")
         self.scene.add_component("Bus", 950, 300, "B5")
-        # Generators at the two ends
-        self.scene.add_component("Gen", 200, 150, "G1")
-        self.scene.add_component("Gen", 900, 150, "G2")
-        # Loads at B2 and B4
-        self.scene.add_component("Load", 400, 450, "L1")
-        self.scene.add_component("Load", 700, 450, "L2")
+        # Generators at the two ends (G1 slack 1.05pu, G2 PV 1.05pu)
+        g1 = self.scene.add_component("Gen", 200, 150, "G1")
+        g1.model.vm_pu = 1.05
+        g2 = self.scene.add_component("Gen", 900, 150, "G2")
+        g2.model.p_mw = 40
+        g2.model.vm_pu = 1.05
+        # Loads at B2 and B4: 30+j10 / 20+j8 (与 docstring 描述一致)
+        l1 = self.scene.add_component("Load", 400, 450, "L1")
+        l1.model.p_mw, l1.model.q_mvar = 30.0, 10.0
+        l2 = self.scene.add_component("Load", 700, 450, "L2")
+        l2.model.p_mw, l2.model.q_mvar = 20.0, 8.0
         # Lines: 4 segments B1-B2, B2-B3, B3-B4, B4-B5
         b = {}
         for uid, it in self.scene._comp_by_uid.items():

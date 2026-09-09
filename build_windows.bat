@@ -43,7 +43,7 @@ if "%HAS_VENV%"=="0" (
 echo.
 
 REM --- Activate venv and install deps ---
-echo [3/5] Installing dependencies: PyQt5 pyqtgraph pandapower numpy pyinstaller ...
+echo [3/5] Installing dependencies from requirements files ...
 call .venv\Scripts\activate.bat
 if errorlevel 1 (
     echo [ERROR] Failed to activate virtual environment.
@@ -51,7 +51,7 @@ if errorlevel 1 (
     exit /b 1
 )
 python -m pip install --upgrade pip --quiet
-python -m pip install PyQt5 pyqtgraph pandapower numpy pyinstaller --quiet
+python -m pip install -r requirements-dev.txt --quiet
 if errorlevel 1 (
     echo [ERROR] Failed to install dependencies.
     pause
@@ -61,7 +61,7 @@ echo.
 
 REM --- Sanity check the imports before packaging ---
 echo [4/5] Sanity-checking imports ...
-python -c "import PyQt5, pyqtgraph, pandapower, numpy; print('  PyQt5', PyQt5.QtCore.PYQT_VERSION_STR); print('  pyqtgraph', pyqtgraph.__version__); print('  pandapower', pandapower.__version__); print('  numpy', numpy.__version__)"
+python -c "import PyQt5, pandapower, numpy; print('  PyQt5', PyQt5.QtCore.PYQT_VERSION_STR); print('  pandapower', pandapower.__version__); print('  numpy', numpy.__version__)"
 if errorlevel 1 (
     echo [ERROR] Imports failed.
     pause

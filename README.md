@@ -15,11 +15,14 @@
 ## 安装
 
 ```bash
-# 推荐: 使用 uv
+# 推荐: 使用 uv (依赖版本见 requirements.txt, 已在 Python 3.13 验证)
 uv venv .venv
 source .venv/bin/activate      # Linux/WSL/macOS
 # .venv\Scripts\activate       # Windows
-uv pip install PyQt5 pyqtgraph pandapower numpy
+uv pip install -r requirements.txt
+
+# 或者直接用 pip
+pip install -r requirements.txt
 ```
 
 ## 运行
@@ -34,7 +37,16 @@ python app.py
 2. 或从左侧元件库点击元件, 然后在画布上点击放置
 3. 把鼠标放到元件边缘的黑色小圆点(端口)上, 拖到另一个元件的端口建立连接
 4. 选中元件, 在右侧面板修改参数
-5. 工具栏点 "▶ 运行潮流"
+5. 工具栏点 "▶ 运行潮流"; 滚轮缩放画布, Ctrl+0 适配视图
+
+## 运行测试
+
+```bash
+pip install -r requirements-dev.txt
+python -m pytest tests -q
+```
+
+`solver` 层 17 个单元用例 + GUI offscreen 冒烟测试, 不需要显示器。
 
 ## 打包成 exe
 
@@ -60,7 +72,7 @@ python app.py
 cd PowerFlowStudio
 py -m venv .venv
 .venv\Scripts\activate
-pip install PyQt5 pyqtgraph pandapower numpy pyinstaller
+pip install -r requirements-dev.txt
 pyinstaller --onefile --windowed --name PowerFlowStudio app.py
 :: 产物: dist\PowerFlowStudio.exe
 ```
@@ -74,12 +86,13 @@ pyinstaller --onefile --windowed --name PowerFlowStudio app.py
 ## 文件结构
 
 ```
-PowerFlowGUI/
+PowerFlowStudio/
 ├── app.py          # 主入口, 工具栏/菜单/快捷键
 ├── canvas.py       # QGraphicsView 画布, 元件与连线
 ├── palette.py      # 左侧元件库面板
 ├── properties.py   # 右侧属性编辑面板
 ├── solver.py       # 拓扑 ↔ pandapower 转换 + 潮流计算
+├── tests/          # pytest 单元 + GUI offscreen 冒烟测试
 └── README.md
 ```
 
