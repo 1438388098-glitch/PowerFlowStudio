@@ -9,7 +9,6 @@ only wires signals and owns the Network.
 """
 from __future__ import annotations
 import copy
-import csv
 import json
 import logging
 import os
@@ -22,9 +21,8 @@ from PyQt5.QtCore import Qt, QThread, pyqtSignal
 from PyQt5.QtGui import QKeySequence
 from PyQt5.QtWidgets import (
     QApplication, QMainWindow, QAction, QMessageBox, QSplitter,
-    QStatusBar, QShortcut, QToolBar, QFileDialog, QDockWidget,
-    QWidget, QVBoxLayout, QTabWidget, QTableWidget, QTableWidgetItem,
-    QHeaderView, QUndoStack
+    QStatusBar, QShortcut, QToolBar, QFileDialog, QDockWidget, QMenu,
+    QUndoStack
 )
 
 from solver import (
@@ -75,135 +73,9 @@ def setup_crash_logger():
 
 
 # -------------------------------------------------------------
-# 结果总览 (docking panel + CSV)
-# -------------------------------------------------------------
-def _fmt(v, nd=3):
-    return f"{v:.{nd}f}" if isinstance(v, (int, float)) else "—"
-
-
-class ResultsPanel(QWidget):
-    """结果总览: 母线表 + 支路表, 运行潮流后填充"""
-    def __init__(self, parent=None):
-        super().__init__(parent)
-        layout = QVBoxLayout(self)
-        layout.setContentsMargins(2, 2, 2, 2)
-        self.tabs = QTabWidget()
-        self.bus_table = QTableWidget()
-        self.branch_table = QTableWidget()
-        for tbl in (self.bus_table, self.branch_table):
-            tbl.setEditTriggers(QTableWidget.NoEditTriggers)
-            tbl.horizontalHeader().setSectionResizeMode(QHeaderView.Stretch)
-            tbl.verticalHeader().setVisible(False)
-        self.tabs.addTab(self.bus_table, "母线")
-        self.tabs.addTab(self.branch_table, "支路")
-        layout.addWidget(self.tabs)
-        # 电压柱状图 (pyqtgraph 可选依赖, 没装则隐藏该页)
-        try:
-            import pyqtgraph as pg
-            self._pg = pg
-            self.plot = pg.PlotWidget()
-            self.plot.setBackground("w")
-            self.plot.showGrid(y=True, alpha=0.3)
-            self.tabs.addTab(self.plot, "电压图")
-            self._has_pg = True
-        except Exception:
-            self._has_pg = False
-
-    def _refresh_plot(self, rows):
-        """rows: [(name, v_pu, ...)] — 画各母线电压柱状图, 0.95/1.05 限值虚线"""
-        pg = self._pg
-        self.plot.clear()
-        self.plot.addLine(y=0.95, pen=pg.mkPen("#c04040", style=Qt.DashLine))
-        self.plot.addLine(y=1.05, pen=pg.mkPen("#c04040", style=Qt.DashLine))
-        vals = [r[1] for r in rows
-                if isinstance(r[1], (int, float)) and r[1] == r[1]]  # 剔除 NaN
-        if not vals:
-            return
-        names = [r[0] for r in rows if isinstance(r[1], (int, float))]
-        bar = pg.BarGraphItem(x=list(range(len(vals))), height=vals,
-                              width=0.6, brush="#3c78c8")
-        self.plot.addItem(bar)
-        self.plot.getAxis("bottom").setTicks([list(enumerate(names))])
-        self.plot.setYRange(min(0.85, min(vals) - 0.05),
-                            max(1.15, max(vals) + 0.05))
-
-    def refresh(self, net: Network):
-        # 母线表
-        rows = [(b.name,
-                 net.bus_voltage_pu.get(uid),
-                 net.bus_voltage_kv.get(uid),
-                 net.bus_va_degree.get(uid))
-                for uid, b in net.buses.items()]
-        rows.sort(key=lambda r: r[0])
-        if self._has_pg:
-            self._refresh_plot(rows)
-        self.bus_table.clear()
-        self.bus_table.setColumnCount(4)
-        self.bus_table.setHorizontalHeaderLabels(["母线", "V (pu)", "V (kV)", "相角 (°)"])
-        self.bus_table.setRowCount(len(rows))
-        for i, (name, v, kv, a) in enumerate(rows):
-            for j, val in enumerate((name, _fmt(v, 4), _fmt(kv, 2), _fmt(a))):
-                self.bus_table.setItem(i, j, QTableWidgetItem(str(val)))
-        # 支路表
-        brows = []
-        for uid, ln in net.lines.items():
-            brows.append(("线路", ln.name,
-                          net.line_p_from_mw.get(uid), net.line_q_from_mvar.get(uid),
-                          net.line_loading_percent.get(uid)))
-        for uid, tr in net.trafos.items():
-            brows.append(("变压器", tr.name,
-                          net.trafo_p_hv_mw.get(uid), net.trafo_q_hv_mvar.get(uid),
-                          net.trafo_loading_percent.get(uid)))
-        for uid, im in net.impedances.items():
-            brows.append(("阻抗", im.name,
-                          net.impedance_p_from_mw.get(uid),
-                          net.impedance_q_from_mvar.get(uid), None))
-        brows.sort(key=lambda r: r[1])
-        self.branch_table.clear()
-        self.branch_table.setColumnCount(5)
-        self.branch_table.setHorizontalHeaderLabels(
-            ["类型", "名称", "P (MW)", "Q (Mvar)", "负载率 (%)"])
-        self.branch_table.setRowCount(len(brows))
-        for i, (kind, name, p, q, loading) in enumerate(brows):
-            vals = (kind, name, _fmt(p, 2), _fmt(q, 2),
-                    _fmt(loading, 1) if loading is not None else "—")
-            for j, val in enumerate(vals):
-                self.branch_table.setItem(i, j, QTableWidgetItem(str(val)))
-
-
-def export_results_csv(net: Network, base_path: str):
-    """把潮流结果导出成两个 CSV(母线/支路), 返回实际写出的文件路径。
-    用 utf-8-sig 编码, Excel 直接打开不乱码。"""
-    base = base_path[:-4] if base_path.lower().endswith(".csv") else base_path
-    bus_csv, branch_csv = base + "_母线.csv", base + "_支路.csv"
-    with open(bus_csv, "w", newline="", encoding="utf-8-sig") as f:
-        w = csv.writer(f)
-        w.writerow(["母线", "V(pu)", "V(kV)", "相角(°)"])
-        for uid, b in sorted(net.buses.items(), key=lambda kv: kv[1].name):
-            w.writerow([b.name,
-                        _fmt(net.bus_voltage_pu.get(uid), 4),
-                        _fmt(net.bus_voltage_kv.get(uid), 2),
-                        _fmt(net.bus_va_degree.get(uid))])
-    with open(branch_csv, "w", newline="", encoding="utf-8-sig") as f:
-        w = csv.writer(f)
-        w.writerow(["类型", "名称", "P(MW)", "Q(Mvar)", "负载率(%)"])
-        for uid, ln in net.lines.items():
-            w.writerow(["线路", ln.name,
-                        _fmt(net.line_p_from_mw.get(uid), 2),
-                        _fmt(net.line_q_from_mvar.get(uid), 2),
-                        _fmt(net.line_loading_percent.get(uid), 1)])
-        for uid, tr in net.trafos.items():
-            w.writerow(["变压器", tr.name,
-                        _fmt(net.trafo_p_hv_mw.get(uid), 2),
-                        _fmt(net.trafo_q_hv_mvar.get(uid), 2),
-                        _fmt(net.trafo_loading_percent.get(uid), 1)])
-        for uid, im in net.impedances.items():
-            w.writerow(["阻抗", im.name,
-                        _fmt(net.impedance_p_from_mw.get(uid), 2),
-                        _fmt(net.impedance_q_from_mvar.get(uid), 2), "—"])
-    return bus_csv, branch_csv
-
-
+from results import (  # noqa: F401  再导出, 对外接口与拆分前一致
+    ResultsPanel, export_results_csv, render_scene_png,
+)
 # -------------------------------------------------------------
 # 拓扑 JSON 解析/校验(独立于 GUI, 方便测试)
 # -------------------------------------------------------------
@@ -323,6 +195,8 @@ class MainWindow(QMainWindow):
         self.addDockWidget(Qt.BottomDockWidgetArea, self.results_dock)
         self._results_ever_shown = False
         self._pf_thread = None
+        # 结果表行点击 → 画布选中该元件
+        self.results_panel.row_activated.connect(self._on_result_row_activated)
 
         # Toolbar
         toolbar = QToolBar()
@@ -372,12 +246,24 @@ class MainWindow(QMainWindow):
 
         # 菜单栏 (工具栏之外的第二入口, 提高可发现性)
         menu_file = self.menuBar().addMenu("文件(&F)")
+        act_new = QAction("新建(&N)", self)
+        act_new.triggered.connect(self._new_file)
+        menu_file.addAction(act_new)
         menu_file.addAction(act_save)
         act_save_as = QAction("另存为(&A)...", self)
         act_save_as.triggered.connect(self._save_topology_as)
         menu_file.addAction(act_save_as)
         menu_file.addAction(act_load)
-        menu_file.addAction(act_export)
+        act_png = QAction("导出画布 PNG(&P)...", self)
+        act_png.triggered.connect(self._export_png)
+        menu_file.addAction(act_png)
+        act_export2 = QAction("导出结果 CSV(&C)...", self)
+        act_export2.triggered.connect(self._export_csv)
+        menu_file.addAction(act_export2)
+        menu_file.addSeparator()
+        self.recent_menu = QMenu("最近文件(&R)", self)
+        menu_file.addMenu(self.recent_menu)
+        self._rebuild_recent_menu()
         menu_file.addSeparator()
         act_quit = QAction("退出(&Q)", self)
         act_quit.triggered.connect(self.close)
@@ -387,15 +273,29 @@ class MainWindow(QMainWindow):
         menu_run.addAction(self.act_dc)
         menu_run.addSeparator()
         for case_name, case_label in (("case14", "IEEE 14 母线"),
-                                      ("case30", "IEEE 30 母线")):
+                                      ("case30", "IEEE 30 母线"),
+                                      ("case39", "IEEE 39 母线")):
             act_case = QAction(case_label, self)
             act_case.triggered.connect(
                 lambda checked=False, cn=case_name: self._load_ieee_case(cn))
             menu_run.addAction(act_case)
         menu_view = self.menuBar().addMenu("视图(&V)")
+        act_zoom_in = QAction("放大(&I)", self)
+        act_zoom_in.triggered.connect(self.view.zoom_in)
+        menu_view.addAction(act_zoom_in)
+        act_zoom_out = QAction("缩小(&O)", self)
+        act_zoom_out.triggered.connect(self.view.zoom_out)
+        menu_view.addAction(act_zoom_out)
         menu_view.addAction(act_fit)
         menu_view.addAction(self.results_dock.toggleViewAction())
+        act_snap = QAction("网格对齐(新元件)", self)
+        act_snap.setCheckable(True)
+        act_snap.triggered.connect(self._toggle_snap)
+        menu_view.addAction(act_snap)
         menu_help = self.menuBar().addMenu("帮助(&H)")
+        act_help = QAction("使用说明(&H)", self)
+        act_help.triggered.connect(self._show_help)
+        menu_help.addAction(act_help)
         act_about = QAction("关于(&A)", self)
         act_about.triggered.connect(
             lambda: QMessageBox.about(
@@ -416,6 +316,8 @@ class MainWindow(QMainWindow):
         QShortcut(QKeySequence("Ctrl+0"), self, activated=self.view.fit_view)
         QShortcut(QKeySequence.Undo, self, activated=self.undo_stack.undo)
         QShortcut(QKeySequence.Redo, self, activated=self.undo_stack.redo)
+        QShortcut(QKeySequence.Save, self, activated=self._save_topology)
+        QShortcut(QKeySequence.New, self, activated=self._new_file)
 
     # ---------- 状态: 标题 / 脏标记 / 撤销 ----------
     def _set_dirty(self, dirty: bool):
@@ -483,10 +385,66 @@ class MainWindow(QMainWindow):
         elif isinstance(item, ConnectionItem):
             self.properties.show_connection(item)
 
+    def _on_result_row_activated(self, kind: str, uid: str):
+        """结果总览表点击行 → 画布选中并居中对应元件"""
+        from canvas import BusItem
+        if not uid:
+            return
+        item = self.scene._comp_by_uid.get(uid)
+        if item is None and kind == "branch":
+            # 线路没有独立图形项, 选中对应连线
+            for c in self.scene._connections:
+                if c.uid == uid:
+                    item = c
+                    break
+        if item is None:
+            return
+        self.scene.clearSelection()
+        item.setSelected(True)
+        self.view.centerOn(item.scenePos())
+
+    def _export_png(self) -> bool:
+        path, _ = QFileDialog.getSaveFileName(
+            self, "导出画布 PNG", "grid.png", "PNG (*.png)"
+        )
+        if not path:
+            return False
+        if not self.scene.items():
+            self.status.showMessage("画布是空的, 没有可导出的内容", 4000)
+            return False
+        if render_scene_png(self.scene, path):
+            self.status.showMessage(f"已导出 {path}", 5000)
+            return True
+        self.status.showMessage("导出失败", 4000)
+        return False
+
+    def _toggle_snap(self, checked: bool) -> None:
+        self.scene.snap_enabled = checked
+        self.status.showMessage(
+            "网格对齐: 开 (影响新放置的元件)" if checked else "网格对齐: 关",
+            3000)
+
+    def _show_help(self):
+        QMessageBox.information(
+            self, "使用说明",
+            "基本操作\n"
+            "  · 左侧元件库按住拖到画布放置; 端口小圆点拖到另一元件建立连线\n"
+            "  · Gen/Load 拖线连到母线 = 改挂接母线\n"
+            "  · 滚轮缩放 / 中键拖拽平移 / Ctrl+0 适配视图\n"
+            "  · 点空白或 ESC 取消选中; ESC 取消正在拖的连线\n"
+            "  · 右键元件: 重命名 / 删除\n\n"
+            "计算与结果\n"
+            "  · Ctrl+R 或 ▶ 运行潮流; 勾选 DC 切换直流潮流\n"
+            "  · 计算菜单可一键加载 IEEE 14/30/39 标准算例\n"
+            "  · 底部结果总览: 点表格行可在画布上定位对应元件\n"
+            "  · 文件菜单可导出结果 CSV 和画布 PNG\n\n"
+            "快捷键\n"
+            "  Ctrl+Z 撤销 / Ctrl+Shift+Z 重做 / Ctrl+S 保存 / Delete 删除选中\n")
+
     # ---------- Toolbar actions ----------
     ASYNC_PF_THRESHOLD = 200   # 母线数超过该值时后台计算, 避免 UI 冻结
 
-    def _run_power_flow(self):
+    def _run_power_flow(self) -> tuple:
         algorithm = "dc" if self.act_dc.isChecked() else "nr"
         if (len(self.network.buses) > self.ASYNC_PF_THRESHOLD
                 and self._pf_thread is None):
@@ -531,7 +489,7 @@ class MainWindow(QMainWindow):
         )
         return True, ""
 
-    def _export_csv(self):
+    def _export_csv(self) -> bool:
         if not self.network.bus_voltage_pu:
             self.status.showMessage("请先运行潮流, 再导出结果", 5000)
             return False
@@ -540,9 +498,54 @@ class MainWindow(QMainWindow):
         )
         if not path:
             return False
-        bus_csv, branch_csv = export_results_csv(self.network, path)
-        self.status.showMessage(f"已导出: {bus_csv} 与 {branch_csv}", 6000)
+        paths = export_results_csv(self.network, path)
+        self.status.showMessage(
+            f"已导出: {paths['bus']} / {paths['branch']} / {paths['genload']}", 6000)
         return True
+
+    def _new_file(self) -> None:
+        """新建: 走未保存确认, 清空画布并解除文件关联"""
+        if not self.confirm_discard_changes():
+            return
+        self._clear_canvas(skip_confirm=True)
+        self._current_path = None
+        self._set_dirty(False)
+        self.undo_stack.clear()
+        self.status.showMessage("已新建空白画布", 3000)
+
+    # ---------- 最近文件 ----------
+    RECENT_KEY = "recent_files"
+    RECENT_MAX = 8
+
+    def _recent_settings(self):
+        from PyQt5.QtCore import QSettings
+        return QSettings("PowerFlowStudio", "PowerFlowStudio")
+
+    def _remember_recent(self, path: str):
+        s = self._recent_settings()
+        files = s.value(self.RECENT_KEY, []) or []
+        if isinstance(files, str):
+            files = [files]
+        files = [f for f in files if f != path]
+        files.insert(0, path)
+        s.setValue(self.RECENT_KEY, files[:self.RECENT_MAX])
+        self._rebuild_recent_menu()
+
+    def _rebuild_recent_menu(self):
+        self.recent_menu.clear()
+        files = self._recent_settings().value(self.RECENT_KEY, []) or []
+        if isinstance(files, str):
+            files = [files]
+        if not files:
+            act = self.recent_menu.addAction("(空)")
+            act.setEnabled(False)
+            return
+        for f in files:
+            act = self.recent_menu.addAction(f)
+            act.triggered.connect(
+                lambda checked=False, p=f: self._load_topology(p)
+                if os.path.exists(p)
+                else self.status.showMessage(f"文件不存在: {p}", 4000))
 
     # ---------- 关闭确认 ----------
     def confirm_discard_changes(self) -> bool:
@@ -564,10 +567,10 @@ class MainWindow(QMainWindow):
             return
         event.accept()
 
-    def _clear_canvas(self):
+    def _clear_canvas(self, skip_confirm=False):
         has_any = (self.network.buses or self.network.gens or self.network.loads
                    or self.network.lines or self.network.trafos or self.network.impedances)
-        if has_any:
+        if has_any and not skip_confirm:
             # In headless tests, default to yes to avoid the dialog blocking.
             if self.isVisible():
                 r = QMessageBox.question(
@@ -592,14 +595,14 @@ class MainWindow(QMainWindow):
         self.properties.clear()
         self.status.showMessage("画布已清空", 2000)
 
-    def _save_topology_as(self):
+    def _save_topology_as(self) -> None:
         path, _ = QFileDialog.getSaveFileName(
             self, "另存为", "topology.json", "JSON (*.json)"
         )
         if path:
             self._save_topology(path)
 
-    def _save_topology(self, path=None):
+    def _save_topology(self, path: str | None = None):
         if path is None:
             path = self._current_path
         if path is None:
@@ -616,10 +619,11 @@ class MainWindow(QMainWindow):
         os.replace(tmp_path, path)
         self._current_path = path
         self._set_dirty(False)
+        self._remember_recent(path)
         self.status.showMessage(f"已保存到 {path}", 4000)
         return path
 
-    def _load_topology(self, path=None):
+    def _load_topology(self, path: str | None = None) -> bool:
         if path is None:
             path, _ = QFileDialog.getOpenFileName(
                 self, "载入拓扑", "", "JSON (*.json)"
@@ -642,10 +646,11 @@ class MainWindow(QMainWindow):
         self._current_path = path
         self._set_dirty(False)
         self.undo_stack.clear()   # 载入后旧撤销历史失效
+        self._remember_recent(path)
         self.status.showMessage(f"已载入 {path}", 4000)
         return True
 
-    def _apply_network(self, net: Network):
+    def _apply_network(self, net: Network) -> None:
         """用解析好的 Network 替换当前网络并重建画布"""
         self._clear_canvas()
         self.network.buses.update(net.buses)
@@ -746,7 +751,7 @@ class MainWindow(QMainWindow):
         self.scene.addItem(conn)
         self.scene._connections.append(conn)
 
-    def _load_ieee_case(self, name: str):
+    def _load_ieee_case(self, name: str) -> None:
         """一键加载 IEEE 标准算例 (pandapower 自带) 并自动跑潮流"""
         from ieee_cases import load_case
         try:

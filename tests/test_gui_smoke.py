@@ -279,12 +279,17 @@ class TestRound3Features:
         ok, msg = run_power_flow(net)
         assert ok, msg
         base = str(tmp_path / "out")
-        bus_csv, branch_csv = export_results_csv(net, base)
-        assert bus_csv.endswith("_母线.csv") and branch_csv.endswith("_支路.csv")
-        bus_text = open(bus_csv, encoding="utf-8-sig").read()
+        paths = export_results_csv(net, base)
+        assert paths["bus"].endswith("_母线.csv")
+        assert paths["branch"].endswith("_支路.csv")
+        assert paths["genload"].endswith("_电源与负荷.csv")
+        bus_text = open(paths["bus"], encoding="utf-8-sig").read()
         assert "B1" in bus_text and "V(pu)" in bus_text
-        branch_text = open(branch_csv, encoding="utf-8-sig").read()
+        branch_text = open(paths["branch"], encoding="utf-8-sig").read()
         assert "线路" in branch_text and "负载率" in branch_text
+        genload_text = open(paths["genload"], encoding="utf-8-sig").read()
+        assert "发电机" in genload_text and "G1" in genload_text
+        assert "负荷" in genload_text and "L1" in genload_text
 
     def test_results_panel_fills_tables(self, qapp):
         from app import ResultsPanel
@@ -422,3 +427,155 @@ class TestRound4Features:
         import pytest
         with pytest.raises(ValueError):
             load_case("case999")
+
+
+class TestRound5Features:
+    def test_loading_color_after_run(self, qapp):
+        """运行潮流后, 线路连线应按负载率着色"""
+        from canvas import COLOR_LOADING_OK, COLOR_LOADING_WARN
+        from app import MainWindow
+        w = MainWindow()
+        w._load_two_end_demo()
+        colors = {c.uid: c.loading_color for c in w.scene._connections
+                  if c.kind == "Line"}
+        assert colors and all(c is not None for c in colors.values())
+        # 正常线路应为绿色系(不过载)
+        from canvas import COLOR_LOADING_CRIT
+        assert not any(c is COLOR_LOADING_CRIT for c in colors.values())
+
+    def test_trafo_label_shows_loading(self, qapp):
+        from app import MainWindow
+        from canvas import BusItem
+        w = MainWindow()
+        w.scene.add_component("Bus", 150, 300)
+        w.scene.add_component("Bus", 600, 300)
+        buses = [it for it in w.scene._comp_by_uid.values() if isinstance(it, BusItem)]
+        t = w.scene.add_component("Trafo", 300, 300)   # 自动挂到两条母线(可能新建)
+        lv_model = w.network.buses[t.model.lv_bus]
+        lv_model.vn_kv = 35.0
+        # 显式建 Bus↔Trafo 连线 (add_component 不画线)
+        hv_item = w.scene._comp_by_uid[t.model.hv_bus]
+        lv_item = w.scene._comp_by_uid[t.model.lv_bus]
+        w.scene.create_connection(hv_item, hv_item.port_item("right"),
+                                  t, t.port_item("p1"))
+        w.scene.create_connection(lv_item, lv_item.port_item("left"),
+                                  t, t.port_item("p2"))
+        w.scene.add_component("Gen", 150, 150)
+        w.scene.add_component("Load", 660, 460)
+        ok, msg = w._run_power_flow()
+        assert ok, msg
+        trafo_conns = [c for c in w.scene._connections if c.kind == "Trafo"]
+        assert trafo_conns
+        assert any("%" in c._label.toPlainText() for c in trafo_conns)
+
+    def test_snap_point(self, qapp):
+        from canvas import CircuitScene
+        from solver import Network
+        scene = CircuitScene(Network())
+        x, y = scene.snap_point(103.0, 97.0)
+        assert (x, y) == (103.0, 97.0), "开关关闭时不吸附"
+        scene.snap_enabled = True
+        x, y = scene.snap_point(103.0, 97.0)
+        assert (x, y) == (100.0, 100.0)
+
+    def test_result_row_click_selects_canvas_item(self, qapp):
+        from app import MainWindow
+        w = MainWindow()
+        w._load_demo()
+        panel = w.results_panel
+        assert panel._bus_row_uids
+        uid = panel._bus_row_uids[0]
+        assert uid
+        panel.row_activated.emit("bus", uid)
+        sel = w.scene.selectedItems()
+        assert len(sel) == 1
+        assert sel[0].model.uid == uid
+
+    def test_render_scene_png(self, qapp, tmp_path):
+        from app import MainWindow, render_scene_png
+        w = MainWindow()
+        w._load_two_end_demo()
+        path = str(tmp_path / "grid.png")
+        assert render_scene_png(w.scene, path)
+        size = os.path.getsize(path)
+        assert size > 5000, f"PNG 太小, 可能渲染失败: {size}B"
+
+    def test_case39_loads_and_converges(self, qapp):
+        from app import MainWindow
+        w = MainWindow()
+        w._load_ieee_case("case39")
+        assert len(w.network.buses) == 39
+        assert w.network.converged, "case39 应收敛"
+        assert len(w.network.gens) >= 10
+
+
+class TestRound6Features:
+    def test_results_module_reexport(self, qapp):
+        """app.py 保留 results 拆分后的再导出, 旧接口不破坏"""
+        import app
+        from results import ResultsPanel as RP, export_results_csv as ex, render_scene_png as rn
+        assert app.ResultsPanel is RP
+        assert app.export_results_csv is ex
+        assert app.render_scene_png is rn
+
+    def test_angle_plot_tab_exists(self, qapp):
+        from results import ResultsPanel
+        panel = ResultsPanel()
+        assert panel._has_pg
+        names = [panel.tabs.tabText(i) for i in range(panel.tabs.count())]
+        assert "相角图" in names and "电压图" in names
+
+    def test_recent_files_menu(self, qapp, tmp_path, monkeypatch):
+        from app import MainWindow
+        from PyQt5.QtCore import QSettings
+        s = QSettings("PowerFlowStudio", "PowerFlowStudio")
+        s.setValue("recent_files", [])
+        w = MainWindow()
+        w.scene.add_component("Bus", 100, 100)
+        path = str(tmp_path / "recent.json")
+        w._save_topology(path)
+        assert w.recent_menu.actions()[0].text() == path
+        w2 = MainWindow()
+        assert w2.recent_menu.actions()[0].text() == path
+        s.setValue("recent_files", [])   # 清理, 不污染真实 QSettings
+
+    def test_new_file_clears_and_unlinks(self, qapp, monkeypatch):
+        from app import MainWindow
+        from PyQt5.QtWidgets import QMessageBox
+        w = MainWindow()
+        w.scene.add_component("Bus", 100, 100)
+        w._set_dirty(True)
+        # "No(不保存)" = 放弃改动继续 → 应清空
+        monkeypatch.setattr("app.QMessageBox.question",
+                            lambda *a, **k: QMessageBox.No)
+        w._new_file()
+        assert len(w.network.buses) == 0, "选不保存后应清空画布"
+        assert w._current_path is None
+        # "Cancel" = 留下 → 不清空
+        w.scene.add_component("Bus", 100, 100)
+        w._set_dirty(True)
+        monkeypatch.setattr("app.QMessageBox.question",
+                            lambda *a, **k: QMessageBox.Cancel)
+        w._new_file()
+        assert len(w.network.buses) == 1, "取消后不应清空画布"
+
+    def test_zoom_buttons(self, qapp):
+        from canvas import CircuitScene, CircuitView
+        from solver import Network
+        scene = CircuitScene(Network())
+        view = CircuitView(scene)
+        m0 = view.transform().m11()
+        view.zoom_in()
+        assert view.transform().m11() > m0
+        view.zoom_out()
+        view.zoom_out()
+        assert view.transform().m11() < m0
+
+    def test_tooltip_after_run(self, qapp):
+        from app import MainWindow
+        w = MainWindow()
+        w._load_demo()
+        items = list(w.scene._comp_by_uid.values())
+        assert all(it.toolTip() for it in items), "元件应有 hover 提示"
+        gen_tip = next(it.toolTip() for it in items if it.model.name == "G1")
+        assert "实际" in gen_tip   # 发电机提示含实际出力

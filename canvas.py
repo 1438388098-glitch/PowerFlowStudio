@@ -44,6 +44,24 @@ V_WARN_LOW = 0.90
 V_WARN_HIGH = 1.05
 V_HIGH = 1.10
 
+# 负载率阈值 (%)
+LOADING_WARN = 80.0
+LOADING_CRIT = 100.0
+
+COLOR_LOADING_OK = QColor(80, 150, 80)       # < 80%: 绿
+COLOR_LOADING_WARN = QColor(220, 170, 40)    # 80-100%: 黄
+COLOR_LOADING_CRIT = QColor(210, 60, 60)     # >= 100%: 红
+
+
+def loading_color(loading_percent: Optional[float]) -> Optional[QColor]:
+    if loading_percent is None or loading_percent != loading_percent:
+        return None
+    if loading_percent >= LOADING_CRIT:
+        return COLOR_LOADING_CRIT
+    if loading_percent >= LOADING_WARN:
+        return COLOR_LOADING_WARN
+    return COLOR_LOADING_OK
+
 
 COLOR_BUS_ISOLATED = QColor(205, 205, 205)   # 孤立母线(NaN 电压): 灰
 
@@ -108,6 +126,7 @@ class BaseComponent(QGraphicsItem):
     def __init__(self, model):
         super().__init__()
         self.model = model
+        self.setToolTip(model.name)   # hover 提示, 运行后由 refresh_results 充实
         self.setFlag(QGraphicsItem.ItemIsMovable, True)
         self.setFlag(QGraphicsItem.ItemIsSelectable, True)
         self.setFlag(QGraphicsItem.ItemSendsScenePositionChanges, True)
@@ -344,6 +363,7 @@ class ConnectionItem(QGraphicsPathItem):
         # 判断是哪类连接: 母线-母线 是线路; 母线-母线 通过变压器/阻抗也是对应分支
         self.kind = "Line"   # 默认; 由 canvas 在创建后根据两端元件修正
         self.uid: Optional[str] = None   # 创建后由 canvas 写入 net.lines / trafos / imp 的 uid
+        self.loading_color: Optional[QColor] = None   # 运行潮流后按负载率着色
         self._label = QGraphicsTextItem("", self)
         self._label.setDefaultTextColor(Qt.darkMagenta)
         f = QFont(); f.setPointSize(7); f.setBold(True)
@@ -371,6 +391,8 @@ class ConnectionItem(QGraphicsPathItem):
             pen_color = COLOR_TRAFO
         elif self.kind == "Impedance":
             pen_color = COLOR_IMP
+        if self.loading_color is not None:
+            pen_color = self.loading_color
         pen = QPen(pen_color, 2.5)
         if self.isSelected():
             pen = QPen(Qt.red, 3.5)
@@ -475,13 +497,28 @@ class CircuitView(QGraphicsView):
         self.scale(factor, factor)
         self.setTransformationAnchor(anchor)
 
-    def fit_view(self):
+    def fit_view(self) -> None:
         """缩放到正好看到全部元件"""
         if self.scene() is None or not self.scene().items():
             self.resetTransform()
             return
         rect = self.scene().itemsBoundingRect().adjusted(-60, -60, 60, 60)
         self.fitInView(rect, Qt.KeepAspectRatio)
+
+    def zoom_in(self):
+        self._zoom_step(self.ZOOM_STEP)
+
+    def zoom_out(self):
+        self._zoom_step(1.0 / self.ZOOM_STEP)
+
+    def _zoom_step(self, factor: float):
+        cur = self.transform().m11()
+        if not (self.ZOOM_MIN <= cur * factor <= self.ZOOM_MAX):
+            return
+        anchor = self.transformationAnchor()
+        self.setTransformationAnchor(QGraphicsView.AnchorViewCenter)
+        self.scale(factor, factor)
+        self.setTransformationAnchor(anchor)
 
     # ---- Mouse interaction ----
     def mousePressEvent(self, event):
@@ -652,6 +689,8 @@ class CircuitScene(QGraphicsScene):
         self._comp_by_uid: Dict[str, BaseComponent] = {}
         self._connections: List[ConnectionItem] = []
         self._name_seq: Dict[str, int] = {}   # 显示名计数器, 按 prefix 分池
+        self.snap_enabled = False             # 网格对齐开关(影响新放置的元件)
+        self.snap_grid = 10.0
         self.selection_changed_handler = None
         self._view = None  # set by set_view() after construction
         # 表驱动: kind -> (model 工厂, model 存入的 network 字典, Item 类)
@@ -665,29 +704,29 @@ class CircuitScene(QGraphicsScene):
         }
 
     # ---- 各元件的 model 工厂(自动绑定母线) ----
-    def _make_bus_model(self, uid, name, x, y):
+    def _make_bus_model(self, uid: str, name: str, x: float, y: float) -> BusNode:
         return BusNode(uid=uid, name=name, x=x, y=y, vn_kv=D.DEFAULT_VN_KV)
 
-    def _make_gen_model(self, uid, name, x, y):
+    def _make_gen_model(self, uid: str, name: str, x: float, y: float) -> GenUnit:
         bus_uid = self._nearest_bus(x, y)
         if bus_uid is None:
             bus_uid = self._ensure_first_bus(x, y)
         return GenUnit(uid=uid, name=name, bus_uid=bus_uid)
 
-    def _make_load_model(self, uid, name, x, y):
+    def _make_load_model(self, uid: str, name: str, x: float, y: float) -> LoadUnit:
         bus_uid = self._nearest_bus(x, y)
         if bus_uid is None:
             bus_uid = self._ensure_first_bus(x, y)
         return LoadUnit(uid=uid, name=name, bus_uid=bus_uid)
 
-    def _make_trafo_model(self, uid, name, x, y):
+    def _make_trafo_model(self, uid: str, name: str, x: float, y: float) -> TrafoBranch:
         uid_a = self._nearest_bus(x, y - D.AUTO_BUS_OFFSET)
         uid_b = self._nearest_bus(x, y + D.AUTO_BUS_OFFSET)
         if uid_a is None or uid_b is None or uid_a == uid_b:
             uid_a, uid_b = self._ensure_two_buses(x, y)
         return TrafoBranch(uid=uid, name=name, hv_bus=uid_a, lv_bus=uid_b)
 
-    def _make_impedance_model(self, uid, name, x, y):
+    def _make_impedance_model(self, uid: str, name: str, x: float, y: float) -> ImpedanceBranch:
         uid_a = self._nearest_bus(x, y - D.AUTO_BUS_OFFSET)
         uid_b = self._nearest_bus(x, y + D.AUTO_BUS_OFFSET)
         if uid_a is None or uid_b is None or uid_a == uid_b:
@@ -711,12 +750,21 @@ class CircuitScene(QGraphicsScene):
                 self._name_seq[key] = n
                 return candidate
 
-    def add_component(self, kind: str, x: float, y: float, name: Optional[str] = None):
+    def snap_point(self, x: float, y: float) -> tuple:
+        """网格对齐开启时把坐标吸附到网格; 关闭时原样返回"""
+        if not self.snap_enabled:
+            return x, y
+        g = self.snap_grid
+        return round(x / g) * g, round(y / g) * g
+
+    def add_component(self, kind: str, x: float, y: float,
+                      name: Optional[str] = None) -> BaseComponent:
         if kind not in self._builders:
             raise ValueError(f"未知元件种类: {kind}")
         make_model, container, item_cls, prefix = self._builders[kind]
         uid = uuid.uuid4().hex[:8]
         name = name or self._next_name(prefix, container)
+        x, y = self.snap_point(x, y)   # 网格对齐(开关默认关)
         model = make_model(uid, name, x, y)
         container[uid] = model
         item = item_cls(model)
@@ -730,12 +778,12 @@ class CircuitScene(QGraphicsScene):
 
         return item
 
-    def set_view(self, view):
+    def set_view(self, view) -> None:
         """Optional back-reference so drop / scene events can reach the view
         (and through it, the status bar)."""
         self._view = view
 
-    def _on_drop(self, comp, kind):
+    def _on_drop(self, comp, kind: str) -> None:
         """Hook called by CircuitView.dropEvent after a successful drop."""
         name = getattr(comp.model, "name", "?")
         if self._view is not None and hasattr(self._view, "window"):
@@ -771,7 +819,7 @@ class CircuitScene(QGraphicsScene):
         self._internal_links.setdefault(bus_uid, []).append(comp_item.model.uid)
 
     def create_connection(self, a_item: BaseComponent, a_port: PortItem,
-                          b_item: BaseComponent, b_port: PortItem):
+                          b_item: BaseComponent, b_port: PortItem) -> Optional[ConnectionItem]:
         # Reject self-loops immediately
         if a_item is b_item:
             return
@@ -852,7 +900,7 @@ class CircuitScene(QGraphicsScene):
         b_item.register_connection(conn)
         self._connections.append(conn)
 
-    def _rebind_genload_to_bus(self, comp_item, bus_item):
+    def _rebind_genload_to_bus(self, comp_item, bus_item) -> None:
         """把 Gen/Load 的挂接母线改到 bus_item (拖线换母线的拓扑转正)"""
         old_uid = comp_item.model.bus_uid
         new_uid = bus_item.model.uid
@@ -870,7 +918,7 @@ class CircuitScene(QGraphicsScene):
                 win.status.showMessage(
                     f"{comp_item.model.name} 已改挂到 {bus_item.model.name}", 3000)
 
-    def delete_item(self, item):
+    def delete_item(self, item) -> None:
         if isinstance(item, BaseComponent):
             uid = item.model.uid
             # 按 item 类型判断, 不要读 model.KIND (dataclass 上没有这个属性)
@@ -939,7 +987,7 @@ class CircuitScene(QGraphicsScene):
             if item in self._connections:
                 self._connections.remove(item)
 
-    def _remove_component(self, comp_uid: str):
+    def _remove_component(self, comp_uid: str) -> None:
         """删掉一个挂接元件(gen/load/trafo/imp): model 与图形项一起清理。
 
         只删 model 不删图形项会留下"幽灵元件"——还能选中/编辑,
@@ -955,7 +1003,7 @@ class CircuitScene(QGraphicsScene):
             self._detach_item_connections(item)
             self.removeItem(item)
 
-    def _detach_item_connections(self, item):
+    def _detach_item_connections(self, item) -> None:
         """把挂在 item 上的所有连线从场景、对端元件、_connections 里摘除"""
         for c in list(item._connections):
             other = c.b_comp if c.a_comp is item else c.a_comp
@@ -966,7 +1014,7 @@ class CircuitScene(QGraphicsScene):
                 self.removeItem(c)
         item._connections.clear()
 
-    def _purge_branches_on_bus(self, bus_uid):
+    def _purge_branches_on_bus(self, bus_uid: str) -> None:
         for d in (self.network.lines, self.network.trafos, self.network.impedances):
             to_del = [uid for uid, br in d.items()
                       if (getattr(br, "from_bus", "") == bus_uid or
@@ -980,22 +1028,51 @@ class CircuitScene(QGraphicsScene):
                     self._remove_component(uid)
 
     # ------- 结果可视化刷新 -------
-    def refresh_results(self):
-        # 重画所有 BusItem (更新电压色)
+    def refresh_results(self) -> None:
+        # 重画所有 BusItem (更新电压色), 并更新 hover 提示
         for uid, item in self._comp_by_uid.items():
             if isinstance(item, BusItem):
                 item.update()
-        # 更新所有连线标签(显示 P/Q / loading)
+            elif isinstance(item, (GenItem, LoadItem)):
+                m = item.model
+                if isinstance(item, GenItem):
+                    p = self.network.gen_p_mw.get(uid)
+                    q = self.network.gen_q_mvar.get(uid)
+                    tip = (f"{m.name}\n设定 P={m.p_mw:.1f} MW, V={m.vm_pu:.3f} pu"
+                           + (f"\n实际 P={p:+.2f} MW, Q={q:+.2f} Mvar"
+                              if p is not None else ""))
+                else:
+                    v = self.network.bus_voltage_pu.get(m.bus_uid)
+                    tip = (f"{m.name}\nP={m.p_mw:.1f} MW, Q={m.q_mvar:.1f} Mvar"
+                           + (f"\n母线电压 {v:.4f} pu" if v is not None else ""))
+                item.setToolTip(tip)
+        # 更新所有连线标签(显示 P/Q / loading) + 按负载率着色
         for c in self._connections:
             if c.kind == "Line" and c.uid and c.uid in self.network.lines:
                 ln = self.network.lines[c.uid]
                 loading = self.network.line_loading_percent.get(c.uid)
                 p_from = self.network.line_p_from_mw.get(c.uid)
                 q_from = self.network.line_q_from_mvar.get(c.uid)
-                if loading is not None and p_from is not None:
-                    txt = f"{p_from:.1f}MW\n{loading:.0f}%"
-                else:
-                    txt = ln.name
+                txt = (f"{p_from:.1f}MW\n{loading:.0f}%"
+                       if loading is not None and p_from is not None else ln.name)
                 c._label.setPlainText(txt)
-                # 重定位标签
+                c.setToolTip(f"线路 {ln.name}"
+                             + (f"\nP={p_from:.2f} MW, Q={q_from:+.2f} Mvar"
+                                f"\n负载率 {loading:.1f}%"
+                                if loading is not None and p_from is not None else ""))
+                c.loading_color = loading_color(loading)
+                c.update()
+                c.refresh()
+            elif c.kind == "Trafo" and c.uid and c.uid in self.network.trafos:
+                loading = self.network.trafo_loading_percent.get(c.uid)
+                p_hv = self.network.trafo_p_hv_mw.get(c.uid)
+                txt = (f"{p_hv:.1f}MW\n{loading:.0f}%"
+                       if loading is not None and p_hv is not None else "")
+                if txt:
+                    c._label.setPlainText(txt)
+                c.setToolTip(f"变压器 {self.network.trafos[c.uid].name}"
+                             + (f"\n高压侧 P={p_hv:+.2f} MW\n负载率 {loading:.1f}%"
+                                if loading is not None and p_hv is not None else ""))
+                c.loading_color = loading_color(loading)
+                c.update()
                 c.refresh()

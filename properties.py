@@ -11,7 +11,7 @@ from PyQt5.QtWidgets import (
 
 class PropertiesPanel(QWidget):
     """选中元件后, 在这里编辑它的字段"""
-    def __init__(self, parent=None):
+    def __init__(self, parent=None) -> None:
         super().__init__(parent)
         self.setFixedWidth(260)
         self.current_item = None
@@ -38,7 +38,7 @@ class PropertiesPanel(QWidget):
 
         self._fields = {}   # attr_name -> input widget
 
-    def show_component(self, comp_item):
+    def show_component(self, comp_item) -> None:
         self.current_item = comp_item
         # 清空旧字段
         self._clear_form()
@@ -93,7 +93,7 @@ class PropertiesPanel(QWidget):
 
         self.refresh_results()
 
-    def show_connection(self, conn_item):
+    def show_connection(self, conn_item) -> None:
         self.current_item = conn_item
         self._clear_form()
         self.title.setText(f"连线: {conn_item.kind}")
@@ -102,15 +102,15 @@ class PropertiesPanel(QWidget):
             self._show_line_form(model)
         self.refresh_results()
 
-    def _scene(self):
+    def _scene(self):  # -> CircuitScene | None
         if hasattr(self, "_scene_ref"):
             return self._scene_ref
         return None
 
-    def attach_scene(self, scene):
+    def attach_scene(self, scene) -> None:
         self._scene_ref = scene
 
-    def _show_line_form(self, model):
+    def _show_line_form(self, model) -> None:
         self._add_name_field_line(model)
         self._add_combo_bus(model, "from_bus", "首端母线", model.from_bus)
         self._add_combo_bus(model, "to_bus", "末端母线", model.to_bus)
@@ -119,12 +119,12 @@ class PropertiesPanel(QWidget):
         self._add_float(model, "x_ohm_per_km", "X (Ω/km)", model.x_ohm_per_km, 0, 10, 4)
         self._add_float(model, "max_i_ka", "载流量 (kA)", model.max_i_ka, 0, 10, 3)
 
-    def _add_name_field_line(self, model):
+    def _add_name_field_line(self, model) -> None:
         e = QLineEdit(model.name)
         e.editingFinished.connect(lambda: self._set_attr(model, "name", e.text()))
         self.form_layout.addRow("名称", e)
 
-    def _clear_form(self):
+    def _clear_form(self) -> None:
         while self.form_layout.count():
             child = self.form_layout.takeAt(0)
             if child.widget():
@@ -136,7 +136,7 @@ class PropertiesPanel(QWidget):
             if child.widget():
                 child.widget().deleteLater()
 
-    def _add_name_field(self):
+    def _add_name_field(self) -> None:
         model = self.current_item.model
         e = QLineEdit(model.name)
         e.editingFinished.connect(lambda: (
@@ -145,7 +145,8 @@ class PropertiesPanel(QWidget):
         ))
         self.form_layout.addRow("名称", e)
 
-    def _add_float(self, model, attr, label, value, mn, mx, decimals):
+    def _add_float(self, model, attr: str, label: str, value: float,
+                   mn: float, mx: float, decimals: int) -> None:
         sb = QDoubleSpinBox()
         sb.setDecimals(decimals)
         sb.setRange(mn, mx)
@@ -155,7 +156,7 @@ class PropertiesPanel(QWidget):
         self.form_layout.addRow(label, sb)
         self._fields[attr] = sb
 
-    def _add_combo_bus(self, model, attr, label, current_uid):
+    def _add_combo_bus(self, model, attr: str, label: str, current_uid: str) -> None:
         from PyQt5.QtWidgets import QComboBox
         cb = QComboBox()
         scene = self._scene()
@@ -171,11 +172,11 @@ class PropertiesPanel(QWidget):
         self.form_layout.addRow(label, cb)
         self._fields[attr] = cb
 
-    def _set_attr(self, model, attr, value):
+    def _set_attr(self, model, attr: str, value) -> None:
         if getattr(model, attr) != value:
             setattr(model, attr, value)
 
-    def refresh_results(self):
+    def refresh_results(self) -> None:
         while self.result_layout.count():
             child = self.result_layout.takeAt(0)
             if child.widget():
@@ -242,7 +243,7 @@ class PropertiesPanel(QWidget):
             elif item.kind == "Impedance" and item.uid in net.impedances:
                 self._show_impedance_results(item.uid)
 
-    def _show_trafo_results(self, uid):
+    def _show_trafo_results(self, uid: str) -> None:
         """变压器潮流结果 (solver 已把 res_trafo 回写到 net.trafo_* 字典)"""
         net = self._scene().network
         l = net.trafo_loading_percent.get(uid)
@@ -258,7 +259,7 @@ class PropertiesPanel(QWidget):
             "低压侧 P/Q",
             f"{pl:+.2f} / {ql:+.2f}" if pl is not None else "—")
 
-    def _show_impedance_results(self, uid):
+    def _show_impedance_results(self, uid: str) -> None:
         """串联阻抗潮流结果 (net.impedance_* 字典, solver 回写)"""
         net = self._scene().network
         pf = net.impedance_p_from_mw.get(uid)
@@ -272,12 +273,12 @@ class PropertiesPanel(QWidget):
             "末端 P/Q",
             f"{pt:+.2f} / {qt:+.2f}" if pt is not None else "—")
 
-    def _add_result(self, label, value):
+    def _add_result(self, label: str, value: str) -> None:
         l = QLabel(value)
         l.setStyleSheet("color: #005500; font-family: monospace;")
         self.result_layout.addRow(label, l)
 
-    def _on_delete(self):
+    def _on_delete(self) -> None:
         scene = self._scene()
         if scene is None or self.current_item is None:
             return
@@ -286,7 +287,7 @@ class PropertiesPanel(QWidget):
         self.title.setText("未选中任何元件")
         self._clear_form()
 
-    def clear(self):
+    def clear(self) -> None:
         self.current_item = None
         self.title.setText("未选中任何元件")
         self._clear_form()
