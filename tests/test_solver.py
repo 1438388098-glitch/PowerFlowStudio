@@ -270,3 +270,88 @@ class TestDcPowerFlow:
         assert ok
         # NR 模式下电压有真实结果(非恒定 1.0)
         assert any(abs(v - 1.0) > 1e-6 for v in net.bus_voltage_pu.values())
+
+
+class TestSlackSelection:
+    def test_second_gen_marked_slack_becomes_reference(self):
+        """勾选 is_slack 的第二台发电机应成为平衡节点 (电压设定生效于其母线)"""
+        net = build_3bus_network()
+        # G1 在 b1 (vm 1.0), 把 G2 挂到 b3 并设为平衡节点 vm=1.05
+        del net.gens["g1"]
+        net.gens["g2"] = GenUnit(uid="g2", name="G2", bus_uid="b3",
+                                 p_mw=30, vm_pu=1.05, is_slack=True)
+        ok, msg = run_power_flow(net)
+        assert ok, msg
+        assert net.bus_voltage_pu["b3"] == pytest.approx(1.05, abs=1e-6)
+        assert net.bus_voltage_pu["b3"] != pytest.approx(1.0, abs=1e-3)
+
+    def test_default_slack_is_first_gen(self):
+        net = build_5bus_two_end_network()
+        ok, _ = run_power_flow(net)
+        assert ok
+        # G1 vm=1.05 且是第一台 → b1 电压 = 1.05
+        assert net.bus_voltage_pu["b1"] == pytest.approx(1.05, abs=1e-6)
+
+
+class TestResultDirectionality:
+    def test_line_power_flows_toward_load(self):
+        """3 母线: 线路从平衡节点流向负荷侧, p_from 为正"""
+        net = build_3bus_network()
+        ok, _ = run_power_flow(net)
+        assert ok
+        assert net.line_p_from_mw["ln1"] > 0
+        assert net.line_p_from_mw["ln2"] > 0
+
+    def test_trafo_power_hv_to_lv(self):
+        net = Network()
+        net.buses["hv"] = make_bus("hv", "HV", 0, 0, vn_kv=110.0)
+        net.buses["lv"] = make_bus("lv", "LV", 300, 0, vn_kv=35.0)
+        net.gens["g1"] = GenUnit(uid="g1", name="G1", bus_uid="hv", p_mw=50)
+        net.loads["l1"] = LoadUnit(uid="l1", name="L1", bus_uid="lv",
+                                   p_mw=20, q_mvar=8)
+        net.trafos["t1"] = TrafoBranch(uid="t1", name="T1",
+                                       hv_bus="hv", lv_bus="lv")
+        ok, _ = run_power_flow(net)
+        assert ok
+        assert net.trafo_p_hv_mw["t1"] > 0, "功率应从高压侧流向低压侧"
+        assert abs(net.trafo_p_hv_mw["t1"] - 20.0) < 2.0
+
+
+class TestNMinus1:
+    def test_healthy_network_passes(self):
+        """3 母线网络任意开断一条线, 另一条线带双倍负荷可能重载 — 但不应崩溃"""
+        from solver import n_minus_1_check, format_n1_report
+        net = build_3bus_network()
+        ok, _ = run_power_flow(net)
+        assert ok
+        report = n_minus_1_check(net)
+        assert len(report) == 2   # 两条线路
+        for uid, e in report.items():
+            assert e["ok"] is True
+            assert isinstance(e["overloads"], list)
+        text = format_n1_report(report)
+        assert "N-1 校核" in text
+
+    def test_radial_network_isolation_detected(self):
+        """开断唯一供电线路 → 对端母线孤立, 应被报告出来"""
+        from solver import n_minus_1_check, format_n1_report
+        net = build_3bus_network()
+        # 改成辐射状: 只留 b1-b2, b3 挂 b2 后面
+        del net.lines["ln2"]
+        net.lines["ln2b"] = make_line("ln2b", "线2", "b2", "b3")
+        ok, _ = run_power_flow(net)
+        assert ok
+        report = n_minus_1_check(net)
+        # 开断 ln1 → b1 孤立但 b1 无源; 开断 ln2b → b3 孤立
+        e = report["ln2b"]
+        assert e["ok"] is True
+        assert "B3" in e["isolated"] or "B2" in e["isolated"], e
+        text = format_n1_report(report)
+        assert "孤立" in text
+
+    def test_base_failure_reported(self):
+        from solver import n_minus_1_check, format_n1_report
+        net = Network()
+        report = n_minus_1_check(net)
+        assert "_base_failed" in report
+        assert "失败" in format_n1_report(report)

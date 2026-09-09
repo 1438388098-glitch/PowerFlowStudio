@@ -34,6 +34,7 @@ class GenUnit:
     vm_pu: float = D.GEN_VM_PU     # 电压设定值 pu
     x: float = 0.0                 # 相对母线的偏移
     y: float = 0.0
+    is_slack: bool = False         # 勾选后该机作为平衡节点(默认仍取第一台)
 
 
 @dataclass
@@ -183,10 +184,12 @@ def build_pandapower(net: Network) -> Tuple[pp.pandapowerNet, Dict[str, Dict]]:
     for uid, b in net.buses.items():
         bus_id_map[uid] = pp.create_bus(pnet, vn_kv=b.vn_kv, name=b.name)
 
-    # 平衡节点: 第一个 Gen 当 ext_grid(slack), 其余 Gen 当 gen(PV 节点)
+    # 平衡节点: 勾选了 is_slack 的发电机优先, 否则第一台; 其余当 gen(PV 节点)
     gen_uids = list(net.gens.keys())
     if gen_uids:
-        first_gen_uid = gen_uids[0]
+        slack_uids = [u for u in gen_uids if net.gens[u].is_slack]
+        ordered = slack_uids + [u for u in gen_uids if u not in slack_uids]
+        first_gen_uid = ordered[0]
         first_gen = net.gens[first_gen_uid]
         pp_id = pp.create_ext_grid(
             pnet,
@@ -195,7 +198,7 @@ def build_pandapower(net: Network) -> Tuple[pp.pandapowerNet, Dict[str, Dict]]:
             name=first_gen.name,
         )
         id_maps["ext"][pp_id] = first_gen_uid
-        for uid in gen_uids[1:]:
+        for uid in ordered[1:]:
             g = net.gens[uid]
             pp_id = pp.create_gen(
                 pnet,
@@ -426,3 +429,83 @@ def _fail(net: Network, msg: str):
     """统一失败出口: 既返回给调用方, 也留在 net.error_msg 里供界面轮询"""
     net.converged = False
     net.error_msg = msg
+
+
+# ============================================================
+# 4. N-1 校核 (逐条开断线路/变压器重跑潮流)
+# ============================================================
+
+def n_minus_1_check(net: Network, algorithm: str = "nr",
+                    loading_limit: float = 100.0) -> dict:
+    """
+    N-1 校核: 开断每条线路/变压器后重跑潮流, 报告越限与孤立母线。
+
+    返回 {支路uid: entry}; entry 字段:
+      kind/name  被开断支路类型与名称
+      ok         开断后潮流是否收敛
+      error      不收敛/失败时的错误信息
+      overloads  [(元件描述, 负载率%)] 超过 loading_limit 的支路
+      isolated   [母线名] 开断后孤立的母线
+    基线未收敛时会先跑一次基线; 基线失败返回 {"_base_failed": 错误}。
+    """
+    import copy as _copy
+    if not net.converged:
+        ok, err = run_power_flow(net, algorithm=algorithm)
+        if not ok:
+            return {"_base_failed": err}
+
+    branches = [("线路", uid, net.lines) for uid in net.lines]
+    branches += [("变压器", uid, net.trafos) for uid in net.trafos]
+
+    report: Dict[str, dict] = {}
+    for kind, uid, container in branches:
+        name = container[uid].name
+        trial = _copy.deepcopy(net)
+        (trial.lines if kind == "线路" else trial.trafos).pop(uid, None)
+        ok, err = run_power_flow(trial, algorithm=algorithm)
+        entry = {"kind": kind, "name": name, "ok": ok,
+                 "error": "", "overloads": [], "isolated": []}
+        if not ok:
+            entry["error"] = err
+        else:
+            for lid, loading in trial.line_loading_percent.items():
+                if loading == loading and loading > loading_limit:
+                    ln = trial.lines.get(lid)
+                    entry["overloads"].append(
+                        (f"线路 {ln.name if ln else lid}", round(loading, 1)))
+            for tid, loading in trial.trafo_loading_percent.items():
+                if loading == loading and loading > loading_limit:
+                    tr = trial.trafos.get(tid)
+                    entry["overloads"].append(
+                        (f"变压器 {tr.name if tr else tid}", round(loading, 1)))
+            for bid, v in trial.bus_voltage_pu.items():
+                if v != v:   # NaN → 孤立
+                    b = trial.buses.get(bid)
+                    entry["isolated"].append(b.name if b else bid)
+        report[uid] = entry
+    return report
+
+
+def format_n1_report(report: dict, loading_limit: float = 100.0) -> str:
+    """把 n_minus_1_check 的报告排版成人话(供对话框/文件)"""
+    if "_base_failed" in report:
+        return f"基线潮流失败, 无法校核: {report['_base_failed']}"
+    problem_lines = []
+    n_problem = 0
+    for e in report.values():
+        if not e["ok"]:
+            n_problem += 1
+            problem_lines.append(
+                f"✗ 开断{e['kind']} {e['name']}: 潮流不收敛 ({e['error']})")
+        elif e["overloads"] or e["isolated"]:
+            n_problem += 1
+            parts = [f"△ 开断{e['kind']} {e['name']}:" ]
+            parts += [f"    越限 {desc} {loading}%" for desc, loading in e["overloads"]]
+            parts += [f"    孤立母线 {name}" for name in e["isolated"]]
+            problem_lines.append("\n".join(parts))
+    header = (f"N-1 校核: 共 {len(report)} 条支路, "
+              f"{n_problem} 条开断后出现问题 "
+              f"(负载率限值 {loading_limit:.0f}%)\n")
+    if not problem_lines:
+        return header + "✓ 全部开断方式下无越限、无孤立母线。"
+    return header + "\n".join(problem_lines)

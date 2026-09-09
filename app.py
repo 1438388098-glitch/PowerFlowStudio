@@ -22,7 +22,7 @@ from PyQt5.QtGui import QKeySequence
 from PyQt5.QtWidgets import (
     QApplication, QMainWindow, QAction, QMessageBox, QSplitter,
     QStatusBar, QShortcut, QToolBar, QFileDialog, QDockWidget, QMenu,
-    QUndoStack
+    QUndoStack, QLabel
 )
 
 from solver import (
@@ -33,6 +33,8 @@ from canvas import CircuitScene, CircuitView, BaseComponent, ConnectionItem
 from palette import ComponentPalette
 from properties import PropertiesPanel
 from undocmds import SnapshotCommand
+
+__version__ = "0.6.0"
 
 
 class PowerFlowThread(QThread):
@@ -207,6 +209,8 @@ class MainWindow(QMainWindow):
         self.act_dc = QAction("DC 直流模式", self)
         self.act_dc.setCheckable(True)
         self.act_dc.setToolTip("勾选后用直流潮流(DC)求解: 只算有功与相角, 速度更快")
+        self.act_dc.toggled.connect(
+            lambda c: self.mode_label.setText("DC" if c else "AC"))
         toolbar.addAction(self.act_dc)
         act_clear = QAction("✖ 清空画布", self)
         act_clear.triggered.connect(self._clear_canvas)
@@ -272,9 +276,15 @@ class MainWindow(QMainWindow):
         menu_run.addAction(self.act_run)
         menu_run.addAction(self.act_dc)
         menu_run.addSeparator()
+        menu_run.addAction("★ 3 母线示例", self._load_demo)
+        menu_run.addAction("⚡ 两端供电示例", self._load_two_end_demo)
+        menu_run.addAction("⛏ N-1 校核(逐条开断)", self._run_n_minus_1)
+        menu_run.addSeparator()
         for case_name, case_label in (("case14", "IEEE 14 母线"),
                                       ("case30", "IEEE 30 母线"),
-                                      ("case39", "IEEE 39 母线")):
+                                      ("case39", "IEEE 39 母线"),
+                                      ("case57", "IEEE 57 母线"),
+                                      ("case118", "IEEE 118 母线")):
             act_case = QAction(case_label, self)
             act_case.triggered.connect(
                 lambda checked=False, cn=case_name: self._load_ieee_case(cn))
@@ -300,15 +310,22 @@ class MainWindow(QMainWindow):
         act_about.triggered.connect(
             lambda: QMessageBox.about(
                 self, "关于 PowerFlowStudio",
-                "潮流计算 GUI · Power Flow Studio\n"
+                f"潮流计算 GUI · Power Flow Studio  v{__version__}\n"
                 "PyQt5 画布 + pandapower 牛顿-拉夫逊/直流潮流内核\n"
-                "拖拽搭建电网, 一键计算, 电压着色与结果总览。"))
+                "拖拽搭建电网, 一键计算, 电压着色、结果总览与 N-1 校核。"))
         menu_help.addAction(act_about)
 
         # Status bar
         self.status = QStatusBar()
         self.setStatusBar(self.status)
         self.status.showMessage("Ready — drag a component from the left into the canvas")
+        self.mode_label = QLabel(" AC ")
+        self.mode_label.setToolTip("当前求解模式: AC=牛顿-拉夫逊, DC=直流潮流")
+        self.status.addPermanentWidget(self.mode_label)
+        self.stats_label = QLabel("")
+        self.stats_label.setToolTip("画布元件统计")
+        self.status.addPermanentWidget(self.stats_label)
+        self._refresh_stats()
 
         # Shortcuts
         QShortcut(QKeySequence("Ctrl+R"), self, activated=self._run_power_flow)
@@ -319,7 +336,41 @@ class MainWindow(QMainWindow):
         QShortcut(QKeySequence.Save, self, activated=self._save_topology)
         QShortcut(QKeySequence.New, self, activated=self._new_file)
 
+        # 恢复上次的窗口几何与面板布局
+        s = self._recent_settings()
+        geometry = s.value("window_geometry")
+        if geometry is not None:
+            self.restoreGeometry(geometry)
+        sizes = s.value("splitter_sizes")
+        if sizes:
+            try:
+                self.centralWidget().setSizes([int(v) for v in sizes])
+            except (TypeError, ValueError):
+                pass
+        if s.value("results_visible", "false") in ("true", True):
+            self.results_dock.show()
+            self._results_ever_shown = True
+
     # ---------- 状态: 标题 / 脏标记 / 撤销 ----------
+    def snapshot_network(self) -> dict:
+        """当前网络快照(供画布拖动撤销取用)"""
+        return network_to_json_dict(self.network)
+
+    def _refresh_stats(self):
+        n = self.network
+        n_branch = len(n.lines) + len(n.trafos) + len(n.impedances)
+        self.stats_label.setText(
+            f"母线{len(n.buses)} 机{len(n.gens)} 负荷{len(n.loads)} 支路{n_branch} ")
+
+    def push_move_undo(self, before: dict, after: dict):
+        """拖动结束: 位置变化作为一次撤销入栈 (无变化不入栈)"""
+        if self._tracking_suspended or self._in_tracked_op:
+            return
+        if before == after:
+            return
+        self._set_dirty(True)
+        self.undo_stack.push(SnapshotCommand(self, before, after, "移动元件"))
+
     def _set_dirty(self, dirty: bool):
         self._dirty = dirty
         self._update_title()
@@ -353,6 +404,7 @@ class MainWindow(QMainWindow):
             after = network_to_json_dict(mw.network)
             if after != before:
                 mw._set_dirty(True)
+                mw._refresh_stats()
                 mw.undo_stack.push(SnapshotCommand(mw, before, after, label))
             return result
 
@@ -403,6 +455,33 @@ class MainWindow(QMainWindow):
         item.setSelected(True)
         self.view.centerOn(item.scenePos())
 
+    def _run_n_minus_1(self):
+        """N-1 校核: 逐条开断线路/变压器重跑潮流, 报告越限与孤立母线"""
+        from solver import n_minus_1_check, format_n1_report
+        if not self.network.buses or not self.network.gens:
+            self.status.showMessage("画布上需要一个可计算的网络(至少母线+发电机)", 5000)
+            return None
+        algorithm = "dc" if self.act_dc.isChecked() else "nr"
+        self.status.showMessage("⏳ N-1 校核计算中...", 0)
+        QApplication.processEvents()
+        report = n_minus_1_check(self.network, algorithm=algorithm)
+        self._refresh_stats()
+        if "_base_failed" not in report:
+            self.scene.refresh_results()
+            self.results_panel.refresh(self.network)
+        text = format_n1_report(report)
+        if len(text) > 4000:
+            msg = QMessageBox(self)
+            msg.setWindowTitle("N-1 校核报告")
+            msg.setText(text.split("\n")[0])
+            msg.setDetailedText(text)
+            msg.setTextInteractionFlags(Qt.TextSelectableByMouse)
+            msg.exec_()
+        else:
+            QMessageBox.information(self, "N-1 校核报告", text)
+        self.status.showMessage("N-1 校核完成", 5000)
+        return True
+
     def _export_png(self) -> bool:
         path, _ = QFileDialog.getSaveFileName(
             self, "导出画布 PNG", "grid.png", "PNG (*.png)"
@@ -420,6 +499,7 @@ class MainWindow(QMainWindow):
 
     def _toggle_snap(self, checked: bool) -> None:
         self.scene.snap_enabled = checked
+        self.scene.update()
         self.status.showMessage(
             "网格对齐: 开 (影响新放置的元件)" if checked else "网格对齐: 关",
             3000)
@@ -474,6 +554,7 @@ class MainWindow(QMainWindow):
             return False, err
         self.network.converged = True
         self.scene.refresh_results()
+        self._refresh_stats()
         if self.properties.current_item is not None:
             self.properties.refresh_results()
         self.results_panel.refresh(self.network)
@@ -481,6 +562,7 @@ class MainWindow(QMainWindow):
             self.results_dock.show()
             self._results_ever_shown = True
         mode = "DC" if algorithm == "dc" else "AC"
+        self.mode_label.setText(mode)
         n_bus = len(self.network.buses)
         n_line = len(self.network.lines) + len(self.network.trafos) + len(self.network.impedances)
         self.status.showMessage(
@@ -520,6 +602,14 @@ class MainWindow(QMainWindow):
     def _recent_settings(self):
         from PyQt5.QtCore import QSettings
         return QSettings("PowerFlowStudio", "PowerFlowStudio")
+
+    def _last_dir(self) -> str:
+        return self._recent_settings().value("last_dir", "") or ""
+
+    def _set_last_dir(self, path: str):
+        d = os.path.dirname(path)
+        if d:
+            self._recent_settings().setValue("last_dir", d)
 
     def _remember_recent(self, path: str):
         s = self._recent_settings()
@@ -565,6 +655,10 @@ class MainWindow(QMainWindow):
         if not self.confirm_discard_changes():
             event.ignore()
             return
+        s = self._recent_settings()
+        s.setValue("window_geometry", self.saveGeometry())
+        s.setValue("splitter_sizes", self.centralWidget().sizes())
+        s.setValue("results_visible", bool(self.results_dock.isVisible()))
         event.accept()
 
     def _clear_canvas(self, skip_confirm=False):
@@ -593,6 +687,7 @@ class MainWindow(QMainWindow):
         self.scene._comp_by_uid.clear()
         self.scene._connections.clear()
         self.properties.clear()
+        self._refresh_stats()
         self.status.showMessage("画布已清空", 2000)
 
     def _save_topology_as(self) -> None:
@@ -606,8 +701,9 @@ class MainWindow(QMainWindow):
         if path is None:
             path = self._current_path
         if path is None:
+            start = os.path.join(self._last_dir(), "topology.json")                 if self._last_dir() else "topology.json"
             path, _ = QFileDialog.getSaveFileName(
-                self, "保存拓扑", "topology.json", "JSON (*.json)"
+                self, "保存拓扑", start, "JSON (*.json)"
             )
             if not path:
                 return None
@@ -620,13 +716,14 @@ class MainWindow(QMainWindow):
         self._current_path = path
         self._set_dirty(False)
         self._remember_recent(path)
+        self._set_last_dir(path)
         self.status.showMessage(f"已保存到 {path}", 4000)
         return path
 
     def _load_topology(self, path: str | None = None) -> bool:
         if path is None:
             path, _ = QFileDialog.getOpenFileName(
-                self, "载入拓扑", "", "JSON (*.json)"
+                self, "载入拓扑", self._last_dir(), "JSON (*.json)"
             )
             if not path:
                 return False
@@ -647,6 +744,7 @@ class MainWindow(QMainWindow):
         self._set_dirty(False)
         self.undo_stack.clear()   # 载入后旧撤销历史失效
         self._remember_recent(path)
+        self._set_last_dir(path)
         self.status.showMessage(f"已载入 {path}", 4000)
         return True
 
@@ -660,6 +758,7 @@ class MainWindow(QMainWindow):
         self.network.trafos.update(net.trafos)
         self.network.impedances.update(net.impedances)
         self._rebuild_scene_from_network()
+        self._refresh_stats()
 
     def _rebuild_scene_from_network(self):
         from canvas import BusItem, GenItem, LoadItem, TrafoItem, ImpedanceItem, ConnectionItem

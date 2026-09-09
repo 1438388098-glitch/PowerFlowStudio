@@ -10,8 +10,8 @@ import csv
 
 from PyQt5.QtCore import Qt, pyqtSignal
 from PyQt5.QtWidgets import (
-    QWidget, QVBoxLayout, QTabWidget, QTableWidget, QTableWidgetItem,
-    QHeaderView
+    QApplication, QWidget, QVBoxLayout, QTabWidget, QTableWidget,
+    QTableWidgetItem, QHeaderView
 )
 
 from solver import Network
@@ -44,6 +44,10 @@ class ResultsPanel(QWidget):
         layout.addWidget(self.tabs)
         self.bus_table.cellClicked.connect(self._on_bus_row)
         self.branch_table.cellClicked.connect(self._on_branch_row)
+        for tbl in (self.bus_table, self.branch_table):
+            tbl.setContextMenuPolicy(Qt.CustomContextMenu)
+            tbl.customContextMenuRequested.connect(
+                lambda pos, t=tbl: self._table_copy_menu(t, pos))
         # 图表页 (pyqtgraph 可选依赖, 没装则隐藏)
         self._pg = None
         try:
@@ -62,6 +66,17 @@ class ResultsPanel(QWidget):
             self._has_pg = False
 
     # ---- 交互 ----
+    def _table_copy_menu(self, table, pos):
+        """右键单元格 → 复制文本"""
+        from PyQt5.QtWidgets import QMenu
+        item = table.itemAt(pos)
+        if item is None:
+            return
+        menu = QMenu(table)
+        menu.addAction(f"复制: {item.text()}",
+                       lambda: QApplication.clipboard().setText(item.text()))
+        menu.exec_(table.viewport().mapToGlobal(pos))
+
     def _on_bus_row(self, row, _col):
         if 0 <= row < len(self._bus_row_uids):
             self.row_activated.emit("bus", self._bus_row_uids[row])

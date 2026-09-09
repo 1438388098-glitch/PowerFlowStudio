@@ -100,10 +100,17 @@ PowerFlowStudio/
 
 ### 🟢 P3 — 大改动 / 长期
 
-1. **没有对齐网格**（用户拖元件是自由坐标）
+1. ~~没有对齐网格~~ — 视图菜单"网格对齐(新元件)" + 背景参考线
 2. **没有复制/粘贴**
-3. **更多算例**：case39/57/118（`ieee_cases.py` 里照 case30 的路子加）
-4. **拓扑/视图解耦**、**求解器抽 Backend 接口**（见第四节）
+3. **拓扑/视图解耦**、**求解器抽 Backend 接口**（见第四节）
+4. **发电机 PV/PQ 类型切换**（is_slack 已支持, 全类型切换未做）
+
+### 其他 2026-09-10 新增能力速查
+
+- N-1 校核：`solver.n_minus_1_check` + 计算菜单入口（逐条开断报告越限/孤立）
+- IEEE 14/30/39/57/118 一键加载：`ieee_cases.py`
+- 拖动位置已纳入撤销快照（`CircuitView` 按压/释放对比 + `push_move_undo`）
+- 生成 README 截图：`python tools/render_screenshot.py`（勿用 offscreen, 见脚本注释）
 
 ---
 

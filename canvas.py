@@ -347,6 +347,21 @@ class ImpedanceItem(LineCompItem):
     SYMBOL = "Z"
 
 
+def kind_of(item) -> str:
+    """元件种类名 — 统一 isinstance 判断链的单一来源"""
+    if isinstance(item, BusItem):
+        return "Bus"
+    if isinstance(item, GenItem):
+        return "Gen"
+    if isinstance(item, LoadItem):
+        return "Load"
+    if isinstance(item, TrafoItem):
+        return "Trafo"
+    if isinstance(item, ImpedanceItem):
+        return "Impedance"
+    return "Base"
+
+
 # ============================================================
 # 连接线
 # ============================================================
@@ -426,6 +441,7 @@ class CircuitView(QGraphicsView):
         # Accept drops from the component palette.
         self.setAcceptDrops(True)
         self._drag_kind: Optional[str] = None  # kind while a drag is over us
+        self._move_before = None   # 拖动前的网络快照, 用于移动撤销
 
     # ---- Drag and drop ----
     def dragEnterEvent(self, event):
@@ -535,6 +551,11 @@ class CircuitView(QGraphicsView):
             if item is None:
                 # 点空白处: 取消选中 (否则选中状态没有取消途径)
                 self.scene().clearSelection()
+            # 记录拖动前快照(移动撤销用); 快照函数由 MainWindow 提供
+            self._move_before = None
+            win = self.window()
+            if hasattr(win, "snapshot_network"):
+                self._move_before = win.snapshot_network()
         super().mousePressEvent(event)
 
     def _start_connection_from_port(self, port, event):
@@ -577,6 +598,14 @@ class CircuitView(QGraphicsView):
             self._pending_port = None
             event.accept()
             return
+        # 普通点击/拖动结束: 若元件被移动, 把移动作为一次撤销入栈
+        if self._move_before is not None:
+            win = self.window()
+            if hasattr(win, "push_move_undo"):
+                after = win.snapshot_network()
+                if after != self._move_before:
+                    win.push_move_undo(self._move_before, after)
+            self._move_before = None
         super().mouseReleaseEvent(event)
 
     def _find_release_target(self, view_pos):
@@ -750,6 +779,22 @@ class CircuitScene(QGraphicsScene):
                 self._name_seq[key] = n
                 return candidate
 
+    def drawBackground(self, painter, rect):
+        """网格对齐开启时绘制背景参考线"""
+        super().drawBackground(painter, rect)
+        if not self.snap_enabled:
+            return
+        step = self.snap_grid * 5   # 50px 一格, 10px 吸附粒度太密不适合画线
+        painter.setPen(QPen(QColor(225, 225, 225), 1))
+        x = int(rect.left() // step) * step
+        while x < rect.right():
+            painter.drawLine(QLineF(x, rect.top(), x, rect.bottom()))
+            x += step
+        y = int(rect.top() // step) * step
+        while y < rect.bottom():
+            painter.drawLine(QLineF(rect.left(), y, rect.right(), y))
+            y += step
+
     def snap_point(self, x: float, y: float) -> tuple:
         """网格对齐开启时把坐标吸附到网格; 关闭时原样返回"""
         if not self.snap_enabled:
@@ -764,7 +809,10 @@ class CircuitScene(QGraphicsScene):
         make_model, container, item_cls, prefix = self._builders[kind]
         uid = uuid.uuid4().hex[:8]
         name = name or self._next_name(prefix, container)
-        x, y = self.snap_point(x, y)   # 网格对齐(开关默认关)
+        # 界外坐标收回画布内(留出元件自身的宽高), 再做网格对齐
+        x = min(max(x, 0.0), max(0.0, D.CANVAS_WIDTH - item_cls.W))
+        y = min(max(y, 0.0), max(0.0, D.CANVAS_HEIGHT - item_cls.H))
+        x, y = self.snap_point(x, y)
         model = make_model(uid, name, x, y)
         container[uid] = model
         item = item_cls(model)
@@ -921,19 +969,7 @@ class CircuitScene(QGraphicsScene):
     def delete_item(self, item) -> None:
         if isinstance(item, BaseComponent):
             uid = item.model.uid
-            # 按 item 类型判断, 不要读 model.KIND (dataclass 上没有这个属性)
-            if isinstance(item, BusItem):
-                kind = "Bus"
-            elif isinstance(item, GenItem):
-                kind = "Gen"
-            elif isinstance(item, LoadItem):
-                kind = "Load"
-            elif isinstance(item, TrafoItem):
-                kind = "Trafo"
-            elif isinstance(item, ImpedanceItem):
-                kind = "Impedance"
-            else:
-                kind = "Base"
+            kind = kind_of(item)
             # 删所有相关连接
             for c in list(self._connections):
                 if c.a_comp is item or c.b_comp is item:

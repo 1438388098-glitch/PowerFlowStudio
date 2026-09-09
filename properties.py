@@ -43,21 +43,11 @@ class PropertiesPanel(QWidget):
         # 清空旧字段
         self._clear_form()
         model = comp_item.model
-        # 从 item 类型判断 kind, 而不是从 model.KIND (dataclass 没这个字段)
-        from canvas import BusItem, GenItem, LoadItem, TrafoItem, ImpedanceItem
-        if isinstance(comp_item, BusItem):
-            kind = "Bus"
-        elif isinstance(comp_item, GenItem):
-            kind = "Gen"
-        elif isinstance(comp_item, LoadItem):
-            kind = "Load"
-        elif isinstance(comp_item, TrafoItem):
-            kind = "Trafo"
-        elif isinstance(comp_item, ImpedanceItem):
-            kind = "Impedance"
-        else:
-            kind = "Line"
+        # kind 判断统一走 canvas.kind_of (单一来源)
+        from canvas import kind_of
+        kind = kind_of(comp_item)
         self.title.setText(f"元件: {kind}  {model.name}")
+        self.title.setToolTip(f"uid: {model.uid}")
 
         if kind == "Bus":
             self._add_name_field()
@@ -67,6 +57,7 @@ class PropertiesPanel(QWidget):
             self._add_combo_bus(model, "bus_uid", "挂接母线", model.bus_uid)
             self._add_float(model, "p_mw", "有功 P (MW)", model.p_mw, 0, 5000, 1)
             self._add_float(model, "vm_pu", "电压 V (pu)", model.vm_pu, 0.8, 1.2, 4)
+            self._add_check(model, "is_slack", "平衡节点 (Slack)")
         elif kind == "Load":
             self._add_name_field()
             self._add_combo_bus(model, "bus_uid", "挂接母线", model.bus_uid)
@@ -96,11 +87,36 @@ class PropertiesPanel(QWidget):
     def show_connection(self, conn_item) -> None:
         self.current_item = conn_item
         self._clear_form()
-        self.title.setText(f"连线: {conn_item.kind}")
+        net = self._scene().network
+        self.title.setText(self._connection_title(conn_item, net))
         if conn_item.kind == "Line" and conn_item.uid:
-            model = self._scene().network.lines[conn_item.uid]
+            model = net.lines[conn_item.uid]
             self._show_line_form(model)
         self.refresh_results()
+
+    def _connection_title(self, conn_item, net):
+        """连线面板标题: 尽量带上两端母线名, 例 '线路 L1: B1 → B2'"""
+        kind = conn_item.kind
+        uid = conn_item.uid
+        try:
+            if kind == "Line" and uid in net.lines:
+                m = net.lines[uid]
+                a = net.buses.get(m.from_bus)
+                b = net.buses.get(m.to_bus)
+                return f"线路 {m.name}: {a.name if a else '?'} → {b.name if b else '?'}"
+            if kind == "Trafo" and uid in net.trafos:
+                m = net.trafos[uid]
+                a = net.buses.get(m.hv_bus)
+                b = net.buses.get(m.lv_bus)
+                return f"变压器 {m.name}: {a.name if a else '?'} ↔ {b.name if b else '?'}"
+            if kind == "Impedance" and uid in net.impedances:
+                m = net.impedances[uid]
+                a = net.buses.get(m.from_bus)
+                b = net.buses.get(m.to_bus)
+                return f"阻抗 {m.name}: {a.name if a else '?'} ↔ {b.name if b else '?'}"
+        except AttributeError:
+            pass
+        return f"连线: {kind}"
 
     def _scene(self):  # -> CircuitScene | None
         if hasattr(self, "_scene_ref"):
@@ -169,6 +185,14 @@ class PropertiesPanel(QWidget):
         cb.currentIndexChanged.connect(
             lambda i: self._set_attr(model, attr, cb.itemData(i))
         )
+        self.form_layout.addRow(label, cb)
+        self._fields[attr] = cb
+
+    def _add_check(self, model, attr: str, label: str) -> None:
+        from PyQt5.QtWidgets import QCheckBox
+        cb = QCheckBox()
+        cb.setChecked(bool(getattr(model, attr, False)))
+        cb.toggled.connect(lambda v: self._set_attr(model, attr, bool(v)))
         self.form_layout.addRow(label, cb)
         self._fields[attr] = cb
 

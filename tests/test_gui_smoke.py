@@ -117,7 +117,7 @@ class TestPropertiesPanel:
         panel = PropertiesPanel()
         panel.attach_scene(scene)
         panel.show_connection(scene._connections[0])   # 不应抛异常
-        assert "连线" in panel.title.text()
+        assert panel.title.text().startswith("线路"), "标题应带线路名与两端母线"
 
     def test_trafo_results_shown_not_placeholder(self, scene, qapp):
         """回归: 变压器结果曾显示'暂未提取'"""
@@ -579,3 +579,148 @@ class TestRound6Features:
         assert all(it.toolTip() for it in items), "元件应有 hover 提示"
         gen_tip = next(it.toolTip() for it in items if it.model.name == "G1")
         assert "实际" in gen_tip   # 发电机提示含实际出力
+
+
+class TestRound7Features:
+    def test_move_undo_restores_position(self, qapp):
+        """拖动后的 Ctrl+Z 应恢复位置"""
+        from app import MainWindow
+        w = MainWindow()
+        b = w.scene.add_component("Bus", 100, 100)
+        # 模拟一次拖动: 记录快照→移动→通知入栈
+        w._move_before = None
+        before = w.snapshot_network()
+        b.setPos(500, 400)
+        assert w.network.buses[b.model.uid].x == 500.0
+        w.push_move_undo(before, w.snapshot_network())
+        w.undo_stack.undo()
+        assert w.network.buses[b.model.uid].x == pytest.approx(100.0)
+        w.undo_stack.redo()
+        assert w.network.buses[b.model.uid].x == pytest.approx(500.0)
+
+    def test_view_drag_hook_snapshot(self, qapp):
+        """视图鼠标按下会记录快照, 释放时无位移则不入栈"""
+        from app import MainWindow
+        w = MainWindow()
+        w.show()
+        n_cmds = w.undo_stack.count()
+        # 直接调钩子: 快照相同 → 不 push
+        same = w.snapshot_network()
+        w.push_move_undo(same, same)
+        assert w.undo_stack.count() == n_cmds
+        w.close()
+
+    def test_case57_loads_and_converges(self, qapp):
+        from app import MainWindow
+        w = MainWindow()
+        w._load_ieee_case("case57")
+        assert w.network.converged, "case57 应收敛"
+        assert len(w.network.buses) == 57
+
+    def test_mode_label_updates(self, qapp):
+        from app import MainWindow
+        w = MainWindow()
+        assert w.mode_label.text().strip() == "AC"
+        w.act_dc.setChecked(True)
+        assert w.mode_label.text().strip() == "DC"
+
+    def test_grid_background_toggle(self, qapp):
+        from canvas import CircuitScene
+        from solver import Network
+        scene = CircuitScene(Network())
+        scene.snap_enabled = True
+        scene.update()   # 不崩溃即可; 绘制在 render 时发生
+        from app import render_scene_png
+        scene.add_component("Bus", 100, 100)
+        import tempfile, os as _os
+        p = _os.path.join(tempfile.gettempdir(), "grid_bg_test.png")
+        assert render_scene_png(scene, p)
+
+    def test_kind_of_helper(self, qapp):
+        from canvas import kind_of, BusItem, TrafoItem
+        from app import MainWindow
+        w = MainWindow()
+        b = w.scene.add_component("Bus", 100, 100)
+        t = w.scene.add_component("Trafo", 400, 400)
+        assert kind_of(b) == "Bus"
+        assert kind_of(t) == "Trafo"
+
+    def test_properties_show_uid_tooltip(self, qapp):
+        from properties import PropertiesPanel
+        from canvas import CircuitScene
+        from solver import Network
+        scene = CircuitScene(Network())
+        b = scene.add_component("Bus", 100, 100)
+        panel = PropertiesPanel()
+        panel.attach_scene(scene)
+        panel.show_component(b)
+        assert b.model.uid in panel.title.toolTip()
+
+    def test_slack_checkbox_roundtrip(self, qapp):
+        """勾选平衡节点 → 保存 → 载入, is_slack 字段不丢"""
+        from app import MainWindow, parse_topology_json, network_to_json_dict
+        w = MainWindow()
+        g = w.scene.add_component("Gen", 150, 150)
+        g.model.is_slack = True
+        data = network_to_json_dict(w.network)
+        net = parse_topology_json(data)
+        assert next(iter(net.gens.values())).is_slack is True
+
+
+class TestRound8Features:
+    def test_case118_loads_and_converges(self, qapp):
+        from app import MainWindow
+        w = MainWindow()
+        w._load_ieee_case("case118")
+        assert len(w.network.buses) == 118
+        assert w.network.converged, "case118 应收敛"
+
+    def test_n1_menu_function(self, qapp, monkeypatch):
+        from app import MainWindow
+        w = MainWindow()
+        w._load_two_end_demo()
+        shown = {}
+        monkeypatch.setattr("app.QMessageBox.information",
+                            lambda *a, **k: shown.setdefault("text", a[2]))
+        assert w._run_n_minus_1() is True
+        assert "N-1 校核" in shown.get("text", "")
+
+    def test_version_defined(self):
+        import app
+        assert hasattr(app, "__version__")
+        assert app.__version__.count(".") == 2
+
+    def test_stats_label_updates(self, qapp):
+        from app import MainWindow
+        w = MainWindow()
+        w.scene.add_component("Bus", 100, 100)
+        w.scene.add_component("Gen", 130, 150)
+        assert "母线1" in w.stats_label.text()
+        assert "机1" in w.stats_label.text()
+
+    def test_out_of_bounds_drop_clamped(self, qapp):
+        from app import MainWindow
+        w = MainWindow()
+        b = w.scene.add_component("Bus", 5000, -300)
+        assert 0 <= b.model.x <= 2000
+        assert 0 <= b.model.y <= 1400
+
+    def test_connection_title_with_bus_names(self, qapp):
+        from properties import PropertiesPanel
+        from canvas import CircuitScene
+        from solver import Network
+        scene = CircuitScene(Network())
+        a = scene.add_component("Bus", 100, 100)
+        b = scene.add_component("Bus", 400, 100)
+        scene.create_connection(a, a.port_item("right"), b, b.port_item("left"))
+        panel = PropertiesPanel()
+        panel.attach_scene(scene)
+        panel.show_connection(scene._connections[0])
+        assert "→" in panel.title.text()
+        assert panel.title.text().startswith("线路")
+
+    def test_table_copy_menu_exists(self, qapp):
+        from PyQt5.QtCore import Qt
+        from results import ResultsPanel
+        panel = ResultsPanel()
+        assert panel.bus_table.contextMenuPolicy() == Qt.CustomContextMenu
