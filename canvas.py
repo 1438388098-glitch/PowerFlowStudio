@@ -13,7 +13,7 @@ from PyQt5.QtGui import (
 )
 from PyQt5.QtWidgets import (
     QGraphicsScene, QGraphicsView, QGraphicsItem,
-    QGraphicsEllipseItem, QGraphicsRectItem, QGraphicsPathItem,
+    QGraphicsEllipseItem, QGraphicsPathItem,
     QGraphicsTextItem, QMenu, QInputDialog
 )
 
@@ -309,7 +309,6 @@ class LoadItem(BaseComponent):
 
     def paint(self, painter, option, widget):
         painter.setRenderHint(QPainter.Antialiasing)
-        rect = QRectF(4, 4, self.W - 8, self.H - 8)
         painter.setBrush(QBrush(COLOR_LOAD_FILL))
         painter.setPen(self.selection_pen(QPen(COLOR_LOAD, 2)))
         # 负荷: 三角形 (▽)
@@ -1003,7 +1002,6 @@ class CircuitScene(QGraphicsScene):
         两端都在复制集内的线路会一并复制并重连; 挂接母线若也被复制
         则自动改挂到副本母线, 否则仍挂原母线。
         """
-        import dataclasses
         if not getattr(self, "_clipboard", None):
             return 0
         model_cls = {"Bus": BusNode, "Gen": GenUnit, "Load": LoadUnit,

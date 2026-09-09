@@ -2,10 +2,9 @@
 properties.py — 右侧属性编辑面板
 选中元件/连线时显示其字段, 修改即时写回 model
 """
-from PyQt5.QtCore import Qt
 from PyQt5.QtWidgets import (
     QWidget, QFormLayout, QLineEdit, QDoubleSpinBox, QLabel,
-    QVBoxLayout, QPushButton, QHBoxLayout, QGroupBox
+    QVBoxLayout, QPushButton, QGroupBox
 )
 
 

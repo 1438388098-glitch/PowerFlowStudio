@@ -78,6 +78,8 @@ class TrafoBranch:
     pfe_kw: float = 0.0
     i0_percent: float = 0.0
     shift_degree: float = 0.0
+    x: float = 0.0                 # 画布坐标 (0,0 表示未记录, 载入时按中点摆放)
+    y: float = 0.0
 
 
 @dataclass
@@ -90,6 +92,8 @@ class ImpedanceBranch:
     rft_pu: float = D.IMP_RFT_PU   # R 从 from 视角的 pu
     xft_pu: float = D.IMP_XFT_PU
     sn_mva: float = D.IMP_SN_MVA
+    x: float = 0.0                 # 画布坐标 (同 TrafoBranch)
+    y: float = 0.0
 
 
 @dataclass
