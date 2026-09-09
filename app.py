@@ -65,6 +65,9 @@ class MainWindow(QMainWindow):
         act_demo = QAction("★ 加载示例", self)
         act_demo.triggered.connect(self._load_demo)
         toolbar.addAction(act_demo)
+        act_two_end = QAction("⚡ 两端供电", self)
+        act_two_end.triggered.connect(self._load_two_end_demo)
+        toolbar.addAction(act_two_end)
         toolbar.addSeparator()
         act_save = QAction("💾 保存拓扑", self)
         act_save.triggered.connect(self._save_topology)
@@ -270,6 +273,45 @@ class MainWindow(QMainWindow):
         # Auto-run power flow once
         self._run_power_flow()
         self.status.showMessage("已加载 3 母线示例 — 可点 ▶ 重新运行", 4000)
+
+    def _load_two_end_demo(self):
+        """Load a 5-bus two-end supply network:
+
+        G1 (slack)                                G2 (PV)
+        50+j20 MW   <- L1 ->  <- L2 ->  <- L3 ->  40+j15 MW
+        1.05 pu     r=0.04+j0.12 per line, all 100 MVA / 110 kV base
+            B1 --- B2 --- B3 --- B4 --- B5
+                   |              |
+                 Load1          Load2
+                30+j10 MW       20+j8 MVAr
+        """
+        self._clear_canvas()
+        # 5 buses in a horizontal line
+        self.scene.add_component("Bus", 150, 300, "B1")
+        self.scene.add_component("Bus", 350, 300, "B2")
+        self.scene.add_component("Bus", 550, 300, "B3")
+        self.scene.add_component("Bus", 750, 300, "B4")
+        self.scene.add_component("Bus", 950, 300, "B5")
+        # Generators at the two ends
+        self.scene.add_component("Gen", 200, 150, "G1")
+        self.scene.add_component("Gen", 900, 150, "G2")
+        # Loads at B2 and B4
+        self.scene.add_component("Load", 400, 450, "L1")
+        self.scene.add_component("Load", 700, 450, "L2")
+        # Lines: 4 segments B1-B2, B2-B3, B3-B4, B4-B5
+        b = {}
+        for uid, it in self.scene._comp_by_uid.items():
+            if uid in self.network.buses:
+                b[self.network.buses[uid].name] = it
+        from canvas import ConnectionItem
+        for a, b_ in [("B1", "B2"), ("B2", "B3"), ("B3", "B4"), ("B4", "B5")]:
+            pa = b[a].port_item("right")
+            pb = b[b_].port_item("left")
+            self.scene.create_connection(b[a], pa, b[b_], pb)
+        # Auto-run
+        self._run_power_flow()
+        self.status.showMessage(
+            "已加载两端供电示例: G1-B1-B2-B3-B4-B5-G2 (B2/B4 带负荷) — 可点 ▶ 重跑", 4000)
 
 
 def main():
