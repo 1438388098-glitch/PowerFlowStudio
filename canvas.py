@@ -130,6 +130,8 @@ class BaseComponent(QGraphicsItem):
         self.setFlag(QGraphicsItem.ItemIsMovable, True)
         self.setFlag(QGraphicsItem.ItemIsSelectable, True)
         self.setFlag(QGraphicsItem.ItemSendsScenePositionChanges, True)
+        self.setAcceptHoverEvents(True)
+        self._hovered = False
         # ItemSendsGeometryChanges 才能让 itemChange 收到 ItemPositionHasChanged
         self.setFlag(QGraphicsItem.ItemSendsGeometryChanges, True)
         self._ports: Dict[str, PortItem] = {}
@@ -185,6 +187,27 @@ class BaseComponent(QGraphicsItem):
                 c.refresh()
         return super().itemChange(change, value)
 
+    def hoverEnterEvent(self, event):
+        self._hovered = True
+        self.update()
+        super().hoverEnterEvent(event)
+
+    def hoverLeaveEvent(self, event):
+        self._hovered = False
+        self.update()
+        super().hoverLeaveEvent(event)
+
+    def selection_pen(self, base_pen):
+        """选中红色加粗; 悬停加粗一档 (子类绘制时统一走这里)"""
+        if self.isSelected():
+            return QPen(Qt.red, base_pen.width() + 1)
+        if self._hovered:
+            pen = QPen(base_pen)
+            pen.setWidthF(base_pen.widthF() + 1)
+            pen.setStyle(Qt.DashLine)
+            return pen
+        return base_pen
+
     def boundingRect(self):
         return QRectF(0, 0, self.W, self.H + 22)
 
@@ -233,21 +256,20 @@ class BusItem(BaseComponent):
         v_pu = self.scene().network.bus_voltage_pu.get(self.model.uid) if self.scene() else None
         fill = voltage_color(v_pu)
         painter.setBrush(fill)
-        pen = QPen(COLOR_BUS, 2)
-        if self.isSelected():
-            pen = QPen(Qt.red, 3)
-        painter.setPen(pen)
+        painter.setPen(self.selection_pen(QPen(COLOR_BUS, 2)))
         painter.drawRoundedRect(rect, 6, 6)
         # 画 "≡" 母线符号 — use QLineF so float coords work
         painter.setPen(QPen(Qt.black, 2))
         for i in range(3):
             y = self.H * 0.3 + i * (self.H * 0.2)
             painter.drawLine(QLineF(self.W * 0.15, y, self.W * 0.85, y))
-        # 电压数值
+        # 电压数值 (标签模式可在视图菜单切换 pu / kV)
         if v_pu is None:
             txt = f"{self.model.vn_kv:.0f} kV"
         elif v_pu != v_pu:
             txt = "未连通"          # NaN: 孤立母线
+        elif getattr(self.scene(), "v_label_mode", "pu") == "kv":
+            txt = f"{v_pu * self.model.vn_kv:.1f} kV"
         else:
             txt = f"{v_pu:.3f} pu"
         self._v_label.setPlainText(txt)
@@ -271,10 +293,7 @@ class GenItem(BaseComponent):
         r = min(self.W, self.H) / 2 - 4
         cx, cy = self.W / 2, self.H / 2
         painter.setBrush(QBrush(COLOR_GEN_FILL))
-        pen = QPen(COLOR_GEN, 2)
-        if self.isSelected():
-            pen = QPen(Qt.red, 3)
-        painter.setPen(pen)
+        painter.setPen(self.selection_pen(QPen(COLOR_GEN, 2)))
         painter.drawEllipse(QPointF(cx, cy), r, r)
         painter.setPen(QPen(Qt.black, 2))
         painter.setFont(QFont("Arial", 12, QFont.Bold))
@@ -292,10 +311,7 @@ class LoadItem(BaseComponent):
         painter.setRenderHint(QPainter.Antialiasing)
         rect = QRectF(4, 4, self.W - 8, self.H - 8)
         painter.setBrush(QBrush(COLOR_LOAD_FILL))
-        pen = QPen(COLOR_LOAD, 2)
-        if self.isSelected():
-            pen = QPen(Qt.red, 3)
-        painter.setPen(pen)
+        painter.setPen(self.selection_pen(QPen(COLOR_LOAD, 2)))
         # 负荷: 三角形 (▽)
         poly = QPolygonF([
             QPointF(self.W / 2, self.H - 4),
@@ -718,7 +734,9 @@ class CircuitScene(QGraphicsScene):
         self._comp_by_uid: Dict[str, BaseComponent] = {}
         self._connections: List[ConnectionItem] = []
         self._name_seq: Dict[str, int] = {}   # 显示名计数器, 按 prefix 分池
+        self._clipboard = None                # copy_selection 的内容
         self.snap_enabled = False             # 网格对齐开关(影响新放置的元件)
+        self.v_label_mode = "pu"              # 母线电压标签: "pu" 或 "kv"
         self.snap_grid = 10.0
         self.selection_changed_handler = None
         self._view = None  # set by set_view() after construction
@@ -965,6 +983,82 @@ class CircuitScene(QGraphicsScene):
             if hasattr(win, "status"):
                 win.status.showMessage(
                     f"{comp_item.model.name} 已改挂到 {bus_item.model.name}", 3000)
+
+    # ------- 复制 / 粘贴 -------
+    def copy_selection(self) -> int:
+        """把选中元件(不含连线)放入内部剪贴板, 返回复制的元件数"""
+        import dataclasses
+        sel = [it for it in self.selectedItems() if isinstance(it, BaseComponent)]
+        if not sel:
+            return 0
+        self._clipboard = {
+            "components": [(kind_of(it), dataclasses.asdict(it.model))
+                           for it in sel]
+        }
+        return len(sel)
+
+    def paste_clipboard(self, offset: tuple = (40, 40)) -> int:
+        """粘贴剪贴板元件: 新 uid / 顺延名字 / 位置偏移。
+
+        两端都在复制集内的线路会一并复制并重连; 挂接母线若也被复制
+        则自动改挂到副本母线, 否则仍挂原母线。
+        """
+        import dataclasses
+        if not getattr(self, "_clipboard", None):
+            return 0
+        model_cls = {"Bus": BusNode, "Gen": GenUnit, "Load": LoadUnit,
+                     "Trafo": TrafoBranch, "Impedance": ImpedanceBranch}
+        containers = {"Bus": self.network.buses, "Gen": self.network.gens,
+                      "Load": self.network.loads,
+                      "Trafo": self.network.trafos,
+                      "Impedance": self.network.impedances}
+        uid_map: Dict[str, str] = {}
+        new_items: List[BaseComponent] = []
+        for kind, mdict in self._clipboard["components"]:
+            container = containers[kind]
+            item_cls = self._builders[kind][2]
+            prefix = self._builders[kind][3]
+            old_uid = mdict.get("uid")
+            new_uid = uuid.uuid4().hex[:8]
+            uid_map[old_uid] = new_uid
+            mdict["uid"] = new_uid
+            mdict["name"] = self._next_name(prefix, container)
+            mdict["x"] = mdict.get("x", 0.0) + offset[0]
+            mdict["y"] = mdict.get("y", 0.0) + offset[1]
+            model = model_cls[kind](**mdict)
+            if kind in ("Gen", "Load"):
+                model.bus_uid = uid_map.get(model.bus_uid, model.bus_uid)
+            container[new_uid] = model
+            item = item_cls(model)
+            item.setPos(model.x, model.y)
+            self.addItem(item)
+            self._comp_by_uid[new_uid] = item
+            if kind in ("Gen", "Load"):
+                self._register_internal_link(item, model.bus_uid)
+            new_items.append(item)
+        # 两端都在复制集内的线路: 复制模型并重建连线
+        for ln in list(self.network.lines.values()):
+            if ln.from_bus in uid_map and ln.to_bus in uid_map:
+                new_line = LineBranch(
+                    uid=uuid.uuid4().hex[:8],
+                    name=self._next_name("L", self.network.lines, seq_key="Line"),
+                    from_bus=uid_map[ln.from_bus],
+                    to_bus=uid_map[ln.to_bus])
+                self.network.lines[new_line.uid] = new_line
+                a = self._comp_by_uid[new_line.from_bus]
+                b = self._comp_by_uid[new_line.to_bus]
+                conn = ConnectionItem(a, a.port_item("right"),
+                                      b, b.port_item("left"))
+                conn.kind = "Line"
+                conn.uid = new_line.uid
+                a.register_connection(conn)
+                b.register_connection(conn)
+                self.addItem(conn)
+                self._connections.append(conn)
+        self.clearSelection()
+        for it in new_items:
+            it.setSelected(True)
+        return len(new_items)
 
     def delete_item(self, item) -> None:
         if isinstance(item, BaseComponent):

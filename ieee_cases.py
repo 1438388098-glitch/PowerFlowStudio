@@ -11,7 +11,8 @@ from solver import (
     LineBranch, TrafoBranch, ImpedanceBranch,
 )
 
-SUPPORTED_CASES = ("case14", "case30", "case39", "case57", "case118")
+SUPPORTED_CASES = ("case14", "case24_ieee_rts", "case30", "case39",
+                   "case57", "case118")
 
 
 def load_case(name: str) -> Network:

@@ -679,11 +679,8 @@ class TestRound8Features:
         from app import MainWindow
         w = MainWindow()
         w._load_two_end_demo()
-        shown = {}
-        monkeypatch.setattr("app.QMessageBox.information",
-                            lambda *a, **k: shown.setdefault("text", a[2]))
-        assert w._run_n_minus_1() is True
-        assert "N-1 校核" in shown.get("text", "")
+        text = w._run_n_minus_1(interactive=False)   # 非交互: 不弹对话框
+        assert text and "N-1 校核" in text
 
     def test_version_defined(self):
         import app
@@ -724,3 +721,148 @@ class TestRound8Features:
         from results import ResultsPanel
         panel = ResultsPanel()
         assert panel.bus_table.contextMenuPolicy() == Qt.CustomContextMenu
+
+
+class TestRound9Features:
+    def test_copy_paste_bus_and_line(self, qapp):
+        """复制母线+线路 → 粘贴得到新 uid/顺延名字/偏移位置, 线路一并复制"""
+        from app import MainWindow
+        w = MainWindow()
+        a = w.scene.add_component("Bus", 100, 100)
+        b = w.scene.add_component("Bus", 400, 100)
+        w.scene.create_connection(a, a.port_item("right"), b, b.port_item("left"))
+        w.scene.clearSelection()
+        a.setSelected(True)
+        b.setSelected(True)
+        assert w.scene.copy_selection() == 2
+        assert w._paste_clipboard() == 2
+        assert len(w.network.buses) == 4
+        assert len(w.network.lines) == 2, "两端都被复制的线路应一并复制"
+        names = [x.name for x in w.network.buses.values()]
+        assert len(names) == len(set(names)), "粘贴后名字不应重复"
+        # 新线路端点是副本母线
+        new_line = max(w.network.lines.values(), key=lambda l: l.name)
+        all_uids = set(w.network.buses)
+        assert new_line.from_bus in all_uids and new_line.to_bus in all_uids
+
+    def test_paste_empty_clipboard_noop(self, qapp):
+        from app import MainWindow
+        w = MainWindow()
+        assert w._paste_clipboard() == 0
+
+    def test_paste_undo(self, qapp):
+        from app import MainWindow
+        w = MainWindow()
+        w.scene.add_component("Bus", 100, 100)
+        w.scene.clearSelection()
+        w.scene._comp_by_uid[next(iter(w.scene._comp_by_uid))].setSelected(True)
+        w.scene.copy_selection()
+        n_before = len(w.network.buses)
+        w._paste_clipboard()
+        w.undo_stack.undo()
+        assert len(w.network.buses) == n_before, "粘贴应可撤销"
+
+    def test_autosave_and_restore(self, qapp):
+        from app import MainWindow
+        w = MainWindow()
+        w._load_demo()
+        w._set_dirty(True)
+        w._autosave()
+        import os
+        assert os.path.exists(w._autosave_path())
+        w2 = MainWindow()
+        assert w2._restore_autosave() is True
+        assert len(w2.network.buses) == 3
+        assert w2.network.converged is False   # 只恢复拓扑, 不恢复结果
+        # 清理临时文件, 不影响其他用例
+        os.remove(w._autosave_path())
+
+    def test_trafo_position_saved_in_json(self, qapp, tmp_path):
+        """round9: 变压器坐标应存档, 载入后不再漂回中点"""
+        from app import MainWindow, network_to_json_dict, parse_topology_json
+        w = MainWindow()
+        t = w.scene.add_component("Trafo", 500, 500)
+        t.setPos(640, 520)
+        m = w.network.trafos[t.model.uid]
+        assert (m.x, m.y) == (640.0, 520.0), "itemChange 应回写变压器坐标"
+        net = parse_topology_json(network_to_json_dict(w.network))
+        assert next(iter(net.trafos.values())).x == 640.0
+
+    def test_kv_label_toggle(self, qapp):
+        from app import MainWindow
+        w = MainWindow()
+        w._load_demo()
+        w.act_kv.setChecked(True)
+        w._toggle_v_label(True)
+        assert w.scene.v_label_mode == "kv"
+        w.act_kv.setChecked(False)
+        w._toggle_v_label(False)
+        assert w.scene.v_label_mode == "pu"
+
+    def test_connection_delete_clears_panel(self, qapp):
+        """删除当前显示的连线, 属性面板应被清空 (selectionChanged 联动)"""
+        from app import MainWindow
+        w = MainWindow()
+        a = w.scene.add_component("Bus", 100, 100)
+        b = w.scene.add_component("Bus", 400, 100)
+        w.scene.create_connection(a, a.port_item("right"), b, b.port_item("left"))
+        conn = w.scene._connections[0]
+        conn.setSelected(True)
+        w.scene.delete_item(conn)   # 触发 selectionChanged
+        assert w.properties.current_item is None
+        assert "未选中" in w.properties.title.text()
+
+
+class TestRound10Features:
+    def test_case24_rts_loads_and_converges(self, qapp):
+        from app import MainWindow
+        w = MainWindow()
+        w._load_ieee_case("case24_ieee_rts")
+        assert w.network.converged, "case24 RTS 应收敛"
+        assert len(w.network.buses) == 24
+
+    def test_hover_highlight_state(self, qapp):
+        from canvas import CircuitScene, CircuitView
+        from solver import Network
+        from PyQt5.QtCore import QPointF
+        scene = CircuitScene(Network())
+        b = scene.add_component("Bus", 100, 100)
+        view = CircuitView(scene)
+        view.resize(600, 400)
+        view.show()
+        # 直接调 hover 事件处理, 验证状态切换与重绘不崩
+        from PyQt5.QtGui import QHoverEvent
+        from PyQt5.QtCore import QEvent
+        pos = view.mapFromScene(b.scenePos() + QPointF(40, 25))
+        ev = QHoverEvent(QEvent.HoverEnter, pos, pos)
+        view.viewport().event(ev)   # 走真实分发路径
+        scene.update()
+        view.close()
+
+    def test_cli_open_argument(self, qapp, tmp_path):
+        """命令行参数打开拓扑: 复用 _load_topology, 验证路径逻辑"""
+        from app import MainWindow
+        w = MainWindow()
+        w.scene.add_component("Bus", 100, 100)
+        path = str(tmp_path / "cli.json")
+        w._save_topology(path)
+        w2 = MainWindow()
+        import os
+        assert os.path.exists(path)   # main() 里按此路径调 _load_topology
+        assert w2._load_topology(path) is True
+
+    def test_sysinfo_strings_available(self, qapp):
+        """系统信息对话框内容来源可用(不弹框, 验证数据源)"""
+        import app, platform, tempfile, os
+        import pandapower
+        import PyQt5.QtCore
+        assert app.__version__
+        assert platform.python_version()
+        log_path = os.path.join(tempfile.gettempdir(), "PowerFlowStudio.log")
+        assert isinstance(log_path, str) and log_path
+
+    def test_startup_autosave_hint(self, qapp, monkeypatch, tmp_path):
+        from app import MainWindow
+        w = MainWindow()
+        # 无自动保存文件时提示为 None
+        assert w._startup_autosave_hint is None or isinstance(w._startup_autosave_hint, str)

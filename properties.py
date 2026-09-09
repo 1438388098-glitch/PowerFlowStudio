@@ -299,7 +299,10 @@ class PropertiesPanel(QWidget):
 
     def _add_result(self, label: str, value: str) -> None:
         l = QLabel(value)
-        l.setStyleSheet("color: #005500; font-family: monospace;")
+        from PyQt5.QtGui import QPalette
+        light = self.palette().color(QPalette.Window).lightness()
+        color = "#005500" if light > 128 else "#7fd67f"   # 深色主题用亮绿
+        l.setStyleSheet(f"color: {color}; font-family: monospace;")
         self.result_layout.addRow(label, l)
 
     def _on_delete(self) -> None:

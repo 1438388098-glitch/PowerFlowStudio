@@ -10,6 +10,10 @@ import sys
 
 import pytest
 
+# offscreen 平台下 pyqtgraph 实际绘屏会在 Windows 上偶发原生崩溃,
+# 测试环境关掉结果 dock 的自动弹出(见 app._finish_power_flow)
+os.environ.setdefault("POWERFLOW_NO_AUTOSHOW", "1")
+
 _exit_status = {"code": None}
 
 

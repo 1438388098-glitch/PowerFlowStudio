@@ -17,7 +17,7 @@ import tempfile
 import time
 from dataclasses import asdict, fields as dc_fields
 
-from PyQt5.QtCore import Qt, QThread, pyqtSignal
+from PyQt5.QtCore import Qt, QThread, QTimer, pyqtSignal
 from PyQt5.QtGui import QKeySequence
 from PyQt5.QtWidgets import (
     QApplication, QMainWindow, QAction, QMessageBox, QSplitter,
@@ -30,6 +30,9 @@ from solver import (
     BusNode, GenUnit, LoadUnit, LineBranch, TrafoBranch, ImpedanceBranch,
 )
 from canvas import CircuitScene, CircuitView, BaseComponent, ConnectionItem
+import pandapower as pp
+import PyQt5.QtCore
+
 from palette import ComponentPalette
 from properties import PropertiesPanel
 from undocmds import SnapshotCommand
@@ -204,6 +207,7 @@ class MainWindow(QMainWindow):
         toolbar = QToolBar()
         self.addToolBar(toolbar)
         self.act_run = QAction("▶ 运行潮流", self)
+        self.act_run.setStatusTip("运行潮流计算 (Ctrl+R)")
         self.act_run.triggered.connect(self._run_power_flow)
         toolbar.addAction(self.act_run)
         self.act_dc = QAction("DC 直流模式", self)
@@ -224,6 +228,7 @@ class MainWindow(QMainWindow):
         toolbar.addAction(act_two_end)
         toolbar.addSeparator()
         act_save = QAction("💾 保存拓扑", self)
+        act_save.setStatusTip("保存拓扑到当前文件 (Ctrl+S); 首次保存会询问路径")
         act_save.triggered.connect(self._save_topology)
         toolbar.addAction(act_save)
         act_load = QAction("📂 载入拓扑", self)
@@ -234,11 +239,13 @@ class MainWindow(QMainWindow):
         toolbar.addAction(act_export)
         toolbar.addSeparator()
         act_undo = QAction("↩ 撤销", self)
+        act_undo.setStatusTip("撤销上一次增删/连线/移动/粘贴 (Ctrl+Z)")
         act_undo.triggered.connect(self.undo_stack.undo)
         act_undo.setEnabled(False)
         self.undo_stack.canUndoChanged.connect(act_undo.setEnabled)
         toolbar.addAction(act_undo)
         act_redo = QAction("↪ 重做", self)
+        act_redo.setStatusTip("重做被撤销的操作 (Ctrl+Shift+Z)")
         act_redo.triggered.connect(self.undo_stack.redo)
         act_redo.setEnabled(False)
         self.undo_stack.canRedoChanged.connect(act_redo.setEnabled)
@@ -265,6 +272,11 @@ class MainWindow(QMainWindow):
         act_export2.triggered.connect(self._export_csv)
         menu_file.addAction(act_export2)
         menu_file.addSeparator()
+        act_autosave = QAction("恢复自动保存(&V)", self)
+        act_autosave.setStatusTip("从临时目录里最近一次的自动保存恢复画布")
+        act_autosave.triggered.connect(self._restore_autosave)
+        menu_file.addAction(act_autosave)
+        menu_file.addSeparator()
         self.recent_menu = QMenu("最近文件(&R)", self)
         menu_file.addMenu(self.recent_menu)
         self._rebuild_recent_menu()
@@ -281,6 +293,7 @@ class MainWindow(QMainWindow):
         menu_run.addAction("⛏ N-1 校核(逐条开断)", self._run_n_minus_1)
         menu_run.addSeparator()
         for case_name, case_label in (("case14", "IEEE 14 母线"),
+                                      ("case24_ieee_rts", "IEEE RTS-24 母线"),
                                       ("case30", "IEEE 30 母线"),
                                       ("case39", "IEEE 39 母线"),
                                       ("case57", "IEEE 57 母线"),
@@ -302,10 +315,18 @@ class MainWindow(QMainWindow):
         act_snap.setCheckable(True)
         act_snap.triggered.connect(self._toggle_snap)
         menu_view.addAction(act_snap)
+        self.act_kv = QAction("母线电压标 kV", self)
+        self.act_kv.setCheckable(True)
+        self.act_kv.setStatusTip("切换母线上方电压标签的显示单位 (pu / kV)")
+        self.act_kv.triggered.connect(self._toggle_v_label)
+        menu_view.addAction(self.act_kv)
         menu_help = self.menuBar().addMenu("帮助(&H)")
         act_help = QAction("使用说明(&H)", self)
         act_help.triggered.connect(self._show_help)
         menu_help.addAction(act_help)
+        act_sysinfo = QAction("系统信息(&S)", self)
+        act_sysinfo.triggered.connect(self._show_sysinfo)
+        menu_help.addAction(act_sysinfo)
         act_about = QAction("关于(&A)", self)
         act_about.triggered.connect(
             lambda: QMessageBox.about(
@@ -316,9 +337,20 @@ class MainWindow(QMainWindow):
         menu_help.addAction(act_about)
 
         # Status bar
+        # 上次自动保存时间提示(须在状态栏创建前算好)
+        autosave_ts = self._recent_settings().value("autosave_time", "")
+        if autosave_ts and os.path.exists(
+                os.path.join(tempfile.gettempdir(),
+                             "PowerFlowStudio_autosave.json")):
+            self._startup_autosave_hint = (
+                f"上次自动保存: {autosave_ts} (文件-恢复自动保存 可取回)")
+        else:
+            self._startup_autosave_hint = None
         self.status = QStatusBar()
         self.setStatusBar(self.status)
-        self.status.showMessage("Ready — drag a component from the left into the canvas")
+        self.status.showMessage(
+            self._startup_autosave_hint
+            or "Ready — drag a component from the left into the canvas")
         self.mode_label = QLabel(" AC ")
         self.mode_label.setToolTip("当前求解模式: AC=牛顿-拉夫逊, DC=直流潮流")
         self.status.addPermanentWidget(self.mode_label)
@@ -351,7 +383,70 @@ class MainWindow(QMainWindow):
             self.results_dock.show()
             self._results_ever_shown = True
 
+        # 编辑快捷键
+        QShortcut(QKeySequence.Copy, self, activated=self._copy_selection)
+        QShortcut(QKeySequence.Paste, self, activated=self._paste_clipboard)
+        # 自动保存(每3分钟, 仅脏画布)
+        self._autosave_timer = QTimer(self)
+        self._autosave_timer.timeout.connect(self._autosave)
+        self._autosave_timer.start(180_000)
+
     # ---------- 状态: 标题 / 脏标记 / 撤销 ----------
+    def _copy_selection(self):
+        n = self.scene.copy_selection()
+        self.status.showMessage(
+            f"已复制 {n} 个元件 (Ctrl+V 粘贴)" if n else "未选中任何元件", 3000)
+        return n
+
+    def _paste_clipboard(self):
+        before = self.snapshot_network()
+        n = self.scene.paste_clipboard()
+        after = self.snapshot_network()
+        if n and after != before:
+            self._set_dirty(True)
+            self._refresh_stats()
+            self.undo_stack.push(SnapshotCommand(self, before, after, "粘贴元件"))
+            self.status.showMessage(f"已粘贴 {n} 个元件", 3000)
+        return n
+
+    # ---------- 自动保存 ----------
+    def _autosave_path(self) -> str:
+        return os.path.join(tempfile.gettempdir(), "PowerFlowStudio_autosave.json")
+
+    def _autosave(self):
+        if not self._dirty or not self.network.buses:
+            return
+        try:
+            data = network_to_json_dict(self.network)
+            with open(self._autosave_path(), "w", encoding="utf-8") as f:
+                json.dump(data, f, ensure_ascii=False, indent=2)
+            self._recent_settings().setValue(
+                "autosave_time", time.strftime("%Y-%m-%d %H:%M:%S"))
+        except Exception:
+            logging.getLogger("powerflow.crash").exception("自动保存失败")
+
+    def _restore_autosave(self) -> bool:
+        """从自动保存恢复(不覆盖 current_path)"""
+        path = self._autosave_path()
+        if not os.path.exists(path):
+            self.status.showMessage("没有可恢复的自动保存", 4000)
+            return False
+        try:
+            with open(path, "r", encoding="utf-8") as f:
+                net = parse_topology_json(json.load(f))
+        except Exception as e:
+            self.status.showMessage(f"自动保存文件损坏: {e}", 5000)
+            return False
+        self._tracking_suspended = True
+        try:
+            self._apply_network(net)
+        finally:
+            self._tracking_suspended = False
+        self.undo_stack.clear()
+        self._set_dirty(True)
+        self.status.showMessage("已从自动保存恢复", 5000)
+        return True
+
     def snapshot_network(self) -> dict:
         """当前网络快照(供画布拖动撤销取用)"""
         return network_to_json_dict(self.network)
@@ -455,8 +550,22 @@ class MainWindow(QMainWindow):
         item.setSelected(True)
         self.view.centerOn(item.scenePos())
 
-    def _run_n_minus_1(self):
-        """N-1 校核: 逐条开断线路/变压器重跑潮流, 报告越限与孤立母线"""
+    def _run_n_minus_1(self, interactive: bool = True):
+        """N-1 校核: 逐条开断线路/变压器重跑潮流, 报告越限与孤立母线。
+
+        interactive=False 只算并返回报告文本(供测试/后续自动化),
+        不弹任何对话框。"""
+        text = self._compute_n1_report()
+        if text is None:
+            return None
+        if interactive:
+            self._show_n1_report(text)
+        self.status.showMessage("N-1 校核完成", 5000)
+        return text
+
+    def _compute_n1_report(self):
+        """跑 N-1 校核并刷新界面, 失败返回 None"""
+
         from solver import n_minus_1_check, format_n1_report
         if not self.network.buses or not self.network.gens:
             self.status.showMessage("画布上需要一个可计算的网络(至少母线+发电机)", 5000)
@@ -469,18 +578,28 @@ class MainWindow(QMainWindow):
         if "_base_failed" not in report:
             self.scene.refresh_results()
             self.results_panel.refresh(self.network)
-        text = format_n1_report(report)
+        return format_n1_report(report)
+
+    def _show_n1_report(self, text: str):
+        """弹 N-1 报告对话框, 支持另存 txt"""
+        msg = QMessageBox(self)
+        msg.setWindowTitle("N-1 校核报告")
         if len(text) > 4000:
-            msg = QMessageBox(self)
-            msg.setWindowTitle("N-1 校核报告")
-            msg.setText(text.split("\n")[0])
+            msg.setText(text.splitlines()[0] + " (详情见下方详细内容)")
             msg.setDetailedText(text)
-            msg.setTextInteractionFlags(Qt.TextSelectableByMouse)
-            msg.exec_()
         else:
-            QMessageBox.information(self, "N-1 校核报告", text)
-        self.status.showMessage("N-1 校核完成", 5000)
-        return True
+            msg.setText(text)
+        msg.setTextInteractionFlags(Qt.TextSelectableByMouse)
+        save_btn = msg.addButton("保存报告...", QMessageBox.ActionRole)
+        msg.addButton("关闭", QMessageBox.RejectRole)
+        msg.exec_()
+        if msg.clickedButton() is save_btn:
+            path, _ = QFileDialog.getSaveFileName(
+                self, "保存 N-1 报告", "n1_report.txt", "文本 (*.txt)")
+            if path:
+                with open(path, "w", encoding="utf-8") as f:
+                    f.write(text)
+                self.status.showMessage(f"N-1 报告已保存到 {path}", 5000)
 
     def _export_png(self) -> bool:
         path, _ = QFileDialog.getSaveFileName(
@@ -499,6 +618,11 @@ class MainWindow(QMainWindow):
 
     def _toggle_snap(self, checked: bool) -> None:
         self.scene.snap_enabled = checked
+        self.scene.update()
+
+    def _toggle_v_label(self, checked: bool) -> None:
+        self.scene.v_label_mode = "kv" if checked else "pu"
+        self.scene.refresh_results()
         self.scene.update()
         self.status.showMessage(
             "网格对齐: 开 (影响新放置的元件)" if checked else "网格对齐: 关",
@@ -520,6 +644,19 @@ class MainWindow(QMainWindow):
             "  · 文件菜单可导出结果 CSV 和画布 PNG\n\n"
             "快捷键\n"
             "  Ctrl+Z 撤销 / Ctrl+Shift+Z 重做 / Ctrl+S 保存 / Delete 删除选中\n")
+
+    def _show_sysinfo(self):
+        import platform as _p
+        log_path = os.path.join(tempfile.gettempdir(), "PowerFlowStudio.log")
+        QMessageBox.information(
+            self, "系统信息",
+            f"PowerFlowStudio v{__version__}\n"
+            f"Python {_p.python_version()}\n"
+            f"PyQt5 {PyQt5.QtCore.PYQT_VERSION_STR}\n"
+            f"pandapower {pp.__version__}\n"
+            f"numpy {__import__('numpy').__version__}\n"
+            f"测试: python -m pytest tests -q\n"
+            f"异常日志: {log_path}")
 
     # ---------- Toolbar actions ----------
     ASYNC_PF_THRESHOLD = 200   # 母线数超过该值时后台计算, 避免 UI 冻结
@@ -558,7 +695,9 @@ class MainWindow(QMainWindow):
         if self.properties.current_item is not None:
             self.properties.refresh_results()
         self.results_panel.refresh(self.network)
-        if not self._results_ever_shown:
+        if not self._results_ever_shown                 and os.environ.get("POWERFLOW_NO_AUTOSHOW") != "1":
+            # offscreen 测试环境下 pyqtgraph 实际绘屏会触发原生崩溃,
+            # 测试通过环境变量关掉自动弹出(图表逻辑仍有用例覆盖)
             self.results_dock.show()
             self._results_ever_shown = True
         mode = "DC" if algorithm == "dc" else "AC"
@@ -793,14 +932,21 @@ class MainWindow(QMainWindow):
             it = TrafoItem(t)
             a = self.network.buses[t.hv_bus]
             b = self.network.buses[t.lv_bus]
-            it.setPos((a.x + b.x) / 2 - 40, (a.y + b.y) / 2 - 25)
+            # 优先用保存的画布坐标; 老文件(0,0)退回两母线中点
+            if t.x or t.y:
+                it.setPos(t.x, t.y)
+            else:
+                it.setPos((a.x + b.x) / 2 - 40, (a.y + b.y) / 2 - 25)
             self.scene.addItem(it)
             self.scene._comp_by_uid[uid] = it
         for uid, im in self.network.impedances.items():
             it = ImpedanceItem(im)
             a = self.network.buses[im.from_bus]
             b = self.network.buses[im.to_bus]
-            it.setPos((a.x + b.x) / 2 - 40, (a.y + b.y) / 2 - 25)
+            if im.x or im.y:
+                it.setPos(im.x, im.y)
+            else:
+                it.setPos((a.x + b.x) / 2 - 40, (a.y + b.y) / 2 - 25)
             self.scene.addItem(it)
             self.scene._comp_by_uid[uid] = it
         # 变压器/阻抗与母线之间的连线(之前载入后悬空漂浮, 看不出接在哪儿)
@@ -909,13 +1055,12 @@ class MainWindow(QMainWindow):
     def _load_two_end_demo(self):
         """Load a 5-bus two-end supply network:
 
-        G1 (slack)                                G2 (PV)
-        50+j20 MW   <- L1 ->  <- L2 ->  <- L3 ->  40+j15 MW
-        1.05 pu     r=0.04+j0.12 per line, all 100 MVA / 110 kV base
+        G1 (slack, 1.05pu, P设定50)          G2 (PV, 1.05pu, P设定40)
             B1 --- B2 --- B3 --- B4 --- B5
-                   |              |
-                 Load1          Load2
-                30+j10 MW       20+j8 MVAr
+                    |              |
+                  Load1          Load2
+                  30+j10          20+j8 (MVA)
+        4 段线路均为默认参数: 10 km, r=0.4 Ω/km, x=0.4 Ω/km (约 4+j4 Ω/段)
         """
         self._tracking_suspended = True
         try:
@@ -978,6 +1123,9 @@ def main():
     app.setStyle("Fusion")
     w = MainWindow()
     w.show()
+    # 命令行带拓扑文件路径则直接打开: python app.py my_grid.json
+    if len(sys.argv) > 1 and os.path.exists(sys.argv[1]):
+        w._load_topology(sys.argv[1])
     sys.exit(app.exec_())
 
 

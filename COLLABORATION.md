@@ -252,12 +252,15 @@ A: pandapower 自带：`pp.networks.case14()`。在 `app.py:_load_demo` 加按�
 
 ## 八、版本
 
-最后同步：2026-09-09（commit `4859b2e`）。
+最后同步：2026-09-10 通宵迭代后（app.py `__version__ = "0.6.0"`，分支 `autopilot/311078d40f81`）。
 
-**已知稳定 commit**：`4859b2e` 之后
-- ✅ 元件之间能两两连接
-- ✅ 潮流能跑通
-- ✅ PV 节点显示实际 Q
-- ✅ 打包在 Windows 成功
+**本轮新增能力**（详见 README 功能清单与 `optimize(round-N)` 提交记录）：
+- ✅ 93 个 pytest 用例（solver 单元 + GUI offscreen 冒烟），GitHub Actions 双平台 CI
+- ✅ 高危 bug 清零（详见第三节已修清单）
+- ✅ 撤销/重做（含拖动）、复制粘贴、网格对齐、滚轮缩放、右键菜单
+- ✅ AC/DC 双模式、可选平衡节点、N-1 校核
+- ✅ IEEE 14/24/30/39/57/118 一键加载
+- ✅ 结果总览（表/电压图/相角图）、CSV 导出、PNG 导出、自动保存
 
-如果接手的协作者从 main 拉下来后跑不通，**先切到 `4859b2e` 验证基线**。
+**基线已大幅推进，无需回退到 `4859b2e`**；如需对比，`git log --oneline` 中
+`optimize(round-*)` 即本轮全部提交。

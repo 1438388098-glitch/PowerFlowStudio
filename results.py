@@ -26,7 +26,7 @@ class ResultsPanel(QWidget):
     点击表格行会发出 row_activated, 由主窗口联动画布选中。"""
     row_activated = pyqtSignal(str, str)   # (kind: bus/branch, uid)
 
-    def __init__(self, parent=None):
+    def __init__(self, parent=None) -> None:
         super().__init__(parent)
         self._bus_row_uids = []
         self._branch_row_uids = []
@@ -66,7 +66,7 @@ class ResultsPanel(QWidget):
             self._has_pg = False
 
     # ---- 交互 ----
-    def _table_copy_menu(self, table, pos):
+    def _table_copy_menu(self, table, pos) -> None:
         """右键单元格 → 复制文本"""
         from PyQt5.QtWidgets import QMenu
         item = table.itemAt(pos)
@@ -77,29 +77,29 @@ class ResultsPanel(QWidget):
                        lambda: QApplication.clipboard().setText(item.text()))
         menu.exec_(table.viewport().mapToGlobal(pos))
 
-    def _on_bus_row(self, row, _col):
+    def _on_bus_row(self, row: int, _col: int) -> None:
         if 0 <= row < len(self._bus_row_uids):
             self.row_activated.emit("bus", self._bus_row_uids[row])
 
-    def _on_branch_row(self, row, _col):
+    def _on_branch_row(self, row: int, _col: int) -> None:
         if 0 <= row < len(self._branch_row_uids):
             self.row_activated.emit("branch", self._branch_row_uids[row])
 
     # ---- 单元格着色 ----
-    def _v_cell_color(self, v):
+    def _v_cell_color(self, v):  # -> QColor | None
         from canvas import voltage_color
         if not isinstance(v, (int, float)) or v != v:
             return None
         return voltage_color(v)
 
-    def _loading_cell_color(self, loading):
+    def _loading_cell_color(self, loading):  # -> QColor | None
         from canvas import loading_color
         if not isinstance(loading, (int, float)) or loading != loading:
             return None
         return loading_color(loading)
 
     # ---- 数据填充 ----
-    def refresh(self, net: Network):
+    def refresh(self, net: Network) -> None:
         rows = [(b.name,
                  net.bus_voltage_pu.get(uid),
                  net.bus_voltage_kv.get(uid),
@@ -112,7 +112,7 @@ class ResultsPanel(QWidget):
         self._fill_bus_table(net, rows)
         self._fill_branch_table(net)
 
-    def _fill_bus_table(self, net: Network, rows):
+    def _fill_bus_table(self, net: Network, rows: list) -> None:
         self.bus_table.clear()
         self.bus_table.setColumnCount(4)
         self.bus_table.setHorizontalHeaderLabels(["母线", "V (pu)", "V (kV)", "相角 (°)"])
@@ -129,7 +129,7 @@ class ResultsPanel(QWidget):
             uid = next((u for u, b in net.buses.items() if b.name == name), None)
             self._bus_row_uids.append(uid or "")
 
-    def _fill_branch_table(self, net: Network):
+    def _fill_branch_table(self, net: Network) -> None:
         brows = []
         for uid, ln in net.lines.items():
             brows.append(("线路", ln.name,
@@ -165,7 +165,7 @@ class ResultsPanel(QWidget):
             self._branch_row_uids.append(uid or "")
 
     # ---- 图表 ----
-    def _bar_plot(self, plot, names, vals, limits=()):
+    def _bar_plot(self, plot, names: list, vals: list, limits: tuple = ()) -> None:
         """清空并重画一张柱状图; limits 为参考虚线 y 值"""
         pg = self._pg
         plot.clear()
@@ -182,14 +182,14 @@ class ResultsPanel(QWidget):
         pad = max(0.1, (hi - lo) * 0.1)
         plot.setYRange(lo - pad, hi + pad)
 
-    def _refresh_plot(self, rows):
+    def _refresh_plot(self, rows: list) -> None:
         vals = [r[1] for r in rows
                 if isinstance(r[1], (int, float)) and r[1] == r[1]]  # 剔除 NaN
         names = [r[0] for r in rows
                  if isinstance(r[1], (int, float)) and r[1] == r[1]]
         self._bar_plot(self.plot, names, vals, limits=(0.95, 1.05))
 
-    def _refresh_va_plot(self, rows):
+    def _refresh_va_plot(self, rows: list) -> None:
         vals = [r[3] for r in rows
                 if isinstance(r[3], (int, float)) and r[3] == r[3]]
         names = [r[0] for r in rows
