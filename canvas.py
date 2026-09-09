@@ -6,7 +6,7 @@ from __future__ import annotations
 import uuid
 from typing import Dict, Optional, List
 
-from PyQt5.QtCore import Qt, QPointF, QRectF, pyqtSignal
+from PyQt5.QtCore import Qt, QPointF, QRectF, QLineF, pyqtSignal
 from PyQt5.QtGui import (
     QBrush, QPen, QColor, QPainter, QPainterPath, QFont, QPolygonF
 )
