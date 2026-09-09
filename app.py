@@ -36,7 +36,14 @@ import PyQt5.QtCore
 
 from palette import ComponentPalette
 from properties import PropertiesPanel
+from results import (  # noqa: F401  再导出, 对外接口与拆分前一致
+    ResultsPanel, export_results_csv, render_scene_png,
+)
+from topo_io import (  # noqa: F401  再导出, 兼容旧导入路径
+    parse_topology_json, network_to_json_dict, _TOPO_SPEC,
+)
 from undocmds import SnapshotCommand
+from ux import SearchDialog, make_minimap_dock
 
 __version__ = "0.6.0"
 
@@ -76,81 +83,6 @@ def setup_crash_logger():
         lg.addHandler(handler)
         lg.propagate = False
     return lg
-
-
-# -------------------------------------------------------------
-from results import (  # noqa: F401  再导出, 对外接口与拆分前一致
-    ResultsPanel, export_results_csv, render_scene_png,
-)
-# -------------------------------------------------------------
-# 拓扑 JSON 解析/校验(独立于 GUI, 方便测试)
-# -------------------------------------------------------------
-_TOPO_SPEC = [
-    ("buses", BusNode), ("gens", GenUnit), ("loads", LoadUnit),
-    ("lines", LineBranch), ("trafos", TrafoBranch),
-    ("impedances", ImpedanceBranch), ("shunts", ShuntUnit),
-]
-
-
-def parse_topology_json(data) -> Network:
-    """把 json.load 出来的 dict 解析成 Network, 带字段与引用校验。
-
-    旧版本直接 BusNode(**b): 多余/缺失键 TypeError、悬空 bus_uid
-    KeyError, 都发生在清空画布之后, 用户面临"存得进读不出"。
-    这里提前解析+校验, 坏文件以可读报错拒绝, 不动当前画布。
-    """
-    if not isinstance(data, dict):
-        raise ValueError("顶层必须是 JSON 对象")
-    net = Network()
-    for key, cls in _TOPO_SPEC:
-        entries = data.get(key, []) or []
-        if not isinstance(entries, list):
-            raise ValueError(f"'{key}' 必须是数组")
-        allowed = {f.name for f in dc_fields(cls)}
-        for entry in entries:
-            if not isinstance(entry, dict):
-                raise ValueError(f"'{key}' 里存在非对象条目: {entry!r}")
-            if "uid" not in entry or "name" not in entry:
-                raise ValueError(f"'{key}' 条目缺少 uid/name: {entry!r}")
-            kwargs = {k: v for k, v in entry.items() if k in allowed}
-            try:
-                obj = cls(**kwargs)
-            except TypeError as e:
-                raise ValueError(
-                    f"'{key}' 条目 {entry.get('name', '?')} 字段无效: {e}")
-            getattr(net, key)[obj.uid] = obj
-    bus_uids = set(net.buses)
-
-    def _check_ref(ref, what, name):
-        if ref not in bus_uids:
-            raise ValueError(f"{what} '{name}' 引用了不存在的母线: {ref!r}")
-
-    for g in net.gens.values():
-        _check_ref(g.bus_uid, "发电机", g.name)
-    for ld in net.loads.values():
-        _check_ref(ld.bus_uid, "负荷", ld.name)
-    for ln in net.lines.values():
-        _check_ref(ln.from_bus, "线路", ln.name)
-        _check_ref(ln.to_bus, "线路", ln.name)
-    for tr in net.trafos.values():
-        _check_ref(tr.hv_bus, "变压器", tr.name)
-        _check_ref(tr.lv_bus, "变压器", tr.name)
-    for im in net.impedances.values():
-        _check_ref(im.from_bus, "阻抗", im.name)
-        _check_ref(im.to_bus, "阻抗", im.name)
-    return net
-
-
-def network_to_json_dict(net: Network) -> dict:
-    return {
-        "buses": [asdict(b) for b in net.buses.values()],
-        "gens": [asdict(g) for g in net.gens.values()],
-        "loads": [asdict(l) for l in net.loads.values()],
-        "lines": [asdict(l) for l in net.lines.values()],
-        "trafos": [asdict(t) for t in net.trafos.values()],
-        "impedances": [asdict(i) for i in net.impedances.values()],
-        "shunts": [asdict(s) for s in net.shunts.values()],
-    }
 
 
 class MainWindow(QMainWindow):
@@ -204,6 +136,15 @@ class MainWindow(QMainWindow):
         self._pf_thread = None
         # 结果表行点击 → 画布选中该元件
         self.results_panel.row_activated.connect(self._on_result_row_activated)
+
+        # 小地图 (右侧, 定时刷新缩略与视口指示框)
+        self.minimap_dock = make_minimap_dock(self.scene, self.view, self)
+        self.addDockWidget(Qt.RightDockWidgetArea, self.minimap_dock)
+        self.minimap_dock.hide()
+        self._minimap_timer = QTimer(self)
+        self._minimap_timer.timeout.connect(self._refresh_minimap)
+        self._minimap_timer.start(600)
+        self._search_dialog = None
 
         # Toolbar
         toolbar = QToolBar()
@@ -328,6 +269,12 @@ class MainWindow(QMainWindow):
         act_snap.setCheckable(True)
         act_snap.triggered.connect(self._toggle_snap)
         menu_view.addAction(act_snap)
+        self.act_minimap = QAction("小地图", self)
+        self.act_minimap.setCheckable(True)
+        self.act_minimap.setChecked(False)
+        self.act_minimap.triggered.connect(
+            lambda c: self.minimap_dock.setVisible(c))
+        menu_view.addAction(self.act_minimap)
         self.act_kv = QAction("母线电压标 kV", self)
         self.act_kv.setCheckable(True)
         self.act_kv.setStatusTip("切换母线上方电压标签的显示单位 (pu / kV)")
@@ -397,6 +344,7 @@ class MainWindow(QMainWindow):
             self._results_ever_shown = True
 
         # 编辑快捷键
+        QShortcut(QKeySequence("Ctrl+F"), self, activated=self._open_search)
         QShortcut(QKeySequence.Copy, self, activated=self._copy_selection)
         QShortcut(QKeySequence.Paste, self, activated=self._paste_clipboard)
         # 自动保存(每3分钟, 仅脏画布)
@@ -405,6 +353,20 @@ class MainWindow(QMainWindow):
         self._autosave_timer.start(180_000)
 
     # ---------- 状态: 标题 / 脏标记 / 撤销 ----------
+    def _open_search(self):
+        if self._search_dialog is None:
+            self._search_dialog = SearchDialog(self.scene, self)
+            self._search_dialog.item_selected.connect(
+                lambda uid: self._on_result_row_activated("bus", uid))
+        self._search_dialog.refresh()
+        self._search_dialog.show()
+        self._search_dialog.raise_()
+        self._search_dialog.edit.setFocus()
+
+    def _refresh_minimap(self):
+        if self.minimap_dock.isVisible():
+            self.minimap_dock._minimap_view.refresh()
+
     def _copy_selection(self):
         n = self.scene.copy_selection()
         self.status.showMessage(
@@ -470,14 +432,14 @@ class MainWindow(QMainWindow):
         self.stats_label.setText(
             f"母线{len(n.buses)} 机{len(n.gens)} 负荷{len(n.loads)} 支路{n_branch} ")
 
-    def push_move_undo(self, before: dict, after: dict):
-        """拖动结束: 位置变化作为一次撤销入栈 (无变化不入栈)"""
+    def push_move_undo(self, before: dict, after: dict, label: str = "移动元件"):
+        """拖动/参数修改: 变化作为一次撤销入栈 (无变化不入栈)"""
         if self._tracking_suspended or self._in_tracked_op:
             return
         if before == after:
             return
         self._set_dirty(True)
-        self.undo_stack.push(SnapshotCommand(self, before, after, "移动元件"))
+        self.undo_stack.push(SnapshotCommand(self, before, after, label))
 
     def _set_dirty(self, dirty: bool):
         self._dirty = dirty

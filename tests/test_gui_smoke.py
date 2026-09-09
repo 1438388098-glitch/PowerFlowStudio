@@ -987,3 +987,79 @@ class TestRoundAFeatures:
         kinds = [panel.branch_table.item(r, 0).text()
                  for r in range(panel.branch_table.rowCount())]
         assert "电容/电抗" in kinds
+
+
+class TestRoundBFeatures:
+    def test_search_dialog_filters_and_locates(self, qapp):
+        from app import MainWindow
+        from ux import SearchDialog
+        from PyQt5.QtCore import Qt
+        w = MainWindow()
+        w._load_demo()
+        dlg = SearchDialog(w.scene)
+        assert dlg.listw.count() == 6   # 3 bus + 1 gen + 2 load
+        dlg.edit.setText("G1")
+        visible = [i for i in range(dlg.listw.count())
+                   if not dlg.listw.item(i).isHidden()]
+        assert len(visible) == 1
+        uid = dlg.listw.item(visible[0]).data(Qt.UserRole)
+        got = {}
+        dlg.item_selected.connect(lambda u: got.update(u=u))
+        dlg._activate(dlg.listw.item(visible[0]))
+        assert got.get("u") == uid
+
+    def test_minimap_dock_refresh(self, qapp):
+        from app import MainWindow
+        w = MainWindow()
+        w._load_two_end_demo()
+        w.minimap_dock.show()
+        w._refresh_minimap()   # 不崩即可
+        view = w.minimap_dock._minimap_view
+        assert view.scene() is w.scene
+
+    def test_apply_alignment_modes(self, qapp):
+        from canvas import apply_alignment, CircuitScene
+        from solver import Network
+        scene = CircuitScene(Network())
+        a = scene.add_component("Bus", 100, 100)
+        b = scene.add_component("Bus", 300, 300)
+        c = scene.add_component("Bus", 500, 500)
+        for it in (a, b, c):
+            it.setSelected(True)
+        assert apply_alignment(scene, "vcenter") == 3
+        xs = [it.x() for it in (a, b, c)]
+        assert len(set(xs)) == 1, "垂直中线对齐后 x 应一致"
+        for it in (a, b, c):
+            it.setSelected(True)
+        assert apply_alignment(scene, "dist_v") == 3
+        ys = sorted(it.y() for it in (a, b, c))
+        assert ys[1] - ys[0] == pytest.approx(ys[2] - ys[1], abs=1e-6)
+
+    def test_align_too_few_noop(self, qapp):
+        from canvas import apply_alignment, CircuitScene
+        from solver import Network
+        scene = CircuitScene(Network())
+        a = scene.add_component("Bus", 100, 100)
+        a.setSelected(True)
+        assert apply_alignment(scene, "hcenter") == 1  # 仅返回数量, 不报错
+
+    def test_property_edit_undo(self, qapp):
+        """改参数 → editingFinished 提交 → Ctrl+Z 恢复"""
+        from app import MainWindow
+        w = MainWindow()
+        w._load_demo()
+        gen_item = next(it for it in w.scene._comp_by_uid.values()
+                        if it.model.name == "G1")
+        gen_item.setSelected(True)   # selectionChanged → properties.show_component
+        p_old = gen_item.model.p_mw
+        sb = w.properties._fields["p_mw"]
+        sb.setValue(66.0)
+        assert gen_item.model.p_mw == 66.0
+        assert not w.undo_stack.canUndo(), "编辑未提交前不应有撤销记录"
+        sb.editingFinished.emit()    # 失焦/回车提交
+        assert w.undo_stack.canUndo()
+        w.undo_stack.undo()
+        # 快照撤销会整体重建画布, 需按名重新查找元件
+        gen_after = next(it for it in w.scene._comp_by_uid.values()
+                         if it.model.name == "G1")
+        assert gen_after.model.p_mw == pytest.approx(p_old), "撤销应恢复原参数"

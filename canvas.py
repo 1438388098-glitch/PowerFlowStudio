@@ -697,6 +697,30 @@ class CircuitView(QGraphicsView):
         menu = QMenu(self)
         item = self.itemAt(event.pos())
         win = self.window()
+        # 多选时的对齐/分布
+        sel_comps = [it for it in self.scene().selectedItems()
+                     if isinstance(it, BaseComponent)]
+        if len(sel_comps) >= 2:
+            align_menu = menu.addMenu("对齐/分布")
+            before_snap = (win.snapshot_network()
+                           if hasattr(win, "snapshot_network") else None)
+
+            def _do_align(mode, _before=before_snap):
+                n = apply_alignment(self.scene(), mode)
+                if _before is not None and hasattr(win, "push_move_undo"):
+                    win.push_move_undo(_before, win.snapshot_network())
+                if hasattr(win, "status"):
+                    win.status.showMessage(f"已对齐 {n} 个元件", 3000)
+
+            align_menu.addAction("水平中线", lambda: _do_align("hcenter"))
+            align_menu.addAction("垂直中线", lambda: _do_align("vcenter"))
+            align_menu.addAction("左对齐", lambda: _do_align("left"))
+            align_menu.addAction("右对齐", lambda: _do_align("right"))
+            align_menu.addAction("顶对齐", lambda: _do_align("top"))
+            align_menu.addAction("底对齐", lambda: _do_align("bottom"))
+            if len(sel_comps) >= 3:
+                align_menu.addAction("横向等间距", lambda: _do_align("dist_h"))
+                align_menu.addAction("纵向等间距", lambda: _do_align("dist_v"))
         if isinstance(item, BaseComponent):
             def _rename():
                 text, ok = QInputDialog.getText(
@@ -1244,3 +1268,53 @@ class CircuitScene(QGraphicsScene):
                 c.loading_color = loading_color(loading)
                 c.update()
                 c.refresh()
+
+
+def apply_alignment(scene, mode: str) -> int:
+    """对齐/分布选中的元件 (右键菜单调用)。mode:
+    left/right/top/bottom/hcenter/vcenter/dist_h/dist_v
+    返回参与数量, 不足时不动作。
+    """
+    items = [it for it in scene.selectedItems() if isinstance(it, BaseComponent)]
+    n = len(items)
+    if n < 2:
+        return n
+    if mode == "left":
+        x = min(it.x() for it in items)
+        for it in items:
+            it.setPos(x, it.y())
+    elif mode == "right":
+        x = max(it.x() + it.W for it in items)
+        for it in items:
+            it.setPos(x - it.W, it.y())
+    elif mode == "top":
+        y = min(it.y() for it in items)
+        for it in items:
+            it.setPos(it.x(), y)
+    elif mode == "bottom":
+        y = max(it.y() + it.H for it in items)
+        for it in items:
+            it.setPos(it.x(), y - it.H)
+    elif mode == "hcenter":
+        cy = sum(it.y() + it.H / 2 for it in items) / n
+        for it in items:
+            it.setPos(it.x(), cy - it.H / 2)
+    elif mode == "vcenter":
+        cx = sum(it.x() + it.W / 2 for it in items) / n
+        for it in items:
+            it.setPos(cx - it.W / 2, it.y())
+    elif mode in ("dist_h", "dist_v"):
+        if n < 3:
+            return n
+        key = (lambda it: it.x()) if mode == "dist_h" else (lambda it: it.y())
+        ordered = sorted(items, key=key)
+        lo, hi = key(ordered[0]), key(ordered[-1])
+        step = (hi - lo) / (n - 1)
+        for i, it in enumerate(ordered):
+            if mode == "dist_h":
+                it.setPos(lo + i * step, it.y())
+            else:
+                it.setPos(it.x(), lo + i * step)
+    else:
+        raise ValueError(f"未知对齐模式: {mode}")
+    return n

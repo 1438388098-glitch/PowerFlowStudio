@@ -36,8 +36,11 @@ class PropertiesPanel(QWidget):
         layout.addWidget(self.delete_btn)
 
         self._fields = {}   # attr_name -> input widget
+        self._editing = False        # 本次参数编辑是否已开始(首个改动发生)
+        self._edit_before = None     # 首个改动前的网络快照
 
     def show_component(self, comp_item) -> None:
+        self._commit_pending_edit()
         self.current_item = comp_item
         # 清空旧字段
         self._clear_form()
@@ -97,6 +100,7 @@ class PropertiesPanel(QWidget):
         self.refresh_results()
 
     def show_connection(self, conn_item) -> None:
+        self._commit_pending_edit()
         self.current_item = conn_item
         self._clear_form()
         net = self._scene().network
@@ -181,6 +185,7 @@ class PropertiesPanel(QWidget):
         sb.setSingleStep(0.01 if mx - mn < 10 else 1.0)
         sb.setValue(value)
         sb.valueChanged.connect(lambda v: self._set_attr(model, attr, v))
+        sb.editingFinished.connect(self._commit_pending_edit)
         self.form_layout.addRow(label, sb)
         self._fields[attr] = sb
 
@@ -195,7 +200,8 @@ class PropertiesPanel(QWidget):
         if idx >= 0:
             cb.setCurrentIndex(idx)
         cb.currentIndexChanged.connect(
-            lambda i: self._set_attr(model, attr, cb.itemData(i))
+            lambda i: (self._set_attr(model, attr, cb.itemData(i)),
+                       self._commit_pending_edit())
         )
         self.form_layout.addRow(label, cb)
         self._fields[attr] = cb
@@ -207,6 +213,7 @@ class PropertiesPanel(QWidget):
         sb.setRange(mn, mx)
         sb.setValue(int(value))
         sb.valueChanged.connect(lambda v: self._set_attr(model, attr, int(v)))
+        sb.editingFinished.connect(self._commit_pending_edit)
         self.form_layout.addRow(label, sb)
         self._fields[attr] = sb
 
@@ -214,13 +221,38 @@ class PropertiesPanel(QWidget):
         from PyQt5.QtWidgets import QCheckBox
         cb = QCheckBox()
         cb.setChecked(bool(getattr(model, attr, False)))
-        cb.toggled.connect(lambda v: self._set_attr(model, attr, bool(v)))
+        cb.toggled.connect(
+            lambda v: (self._set_attr(model, attr, bool(v)),
+                       self._commit_pending_edit()))
         self.form_layout.addRow(label, cb)
         self._fields[attr] = cb
 
+    def _main_window(self):
+        scene = self._scene()
+        if scene is not None and getattr(scene, "_view", None) is not None:
+            return scene._view.window()
+        return None
+
+    def _commit_pending_edit(self):
+        """把本次参数编辑(首个改动前快照 -> 当前)作为一条撤销记录提交"""
+        if self._editing and self._edit_before is not None:
+            win = self._main_window()
+            if hasattr(win, "push_move_undo"):
+                win.push_move_undo(self._edit_before,
+                                   win.snapshot_network(), "修改参数")
+        self._editing = False
+        self._edit_before = None
+
     def _set_attr(self, model, attr: str, value) -> None:
-        if getattr(model, attr) != value:
-            setattr(model, attr, value)
+        if getattr(model, attr) == value:
+            return
+        if not self._editing:
+            # 首个改动: 记录改动前快照, 直到提交前都算同一次编辑
+            win = self._main_window()
+            self._edit_before = (win.snapshot_network()
+                                 if hasattr(win, "snapshot_network") else None)
+            self._editing = True
+        setattr(model, attr, value)
 
     def refresh_results(self) -> None:
         while self.result_layout.count():
@@ -348,6 +380,7 @@ class PropertiesPanel(QWidget):
         self._clear_form()
 
     def clear(self) -> None:
+        self._commit_pending_edit()
         self.current_item = None
         self.title.setText("未选中任何元件")
         self._clear_form()
