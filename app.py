@@ -1,20 +1,19 @@
 """
-app.py — 主程序入口
-- 左侧: 元件库
-- 中间: 画布 (拖拽/连线/选中/删除)
-- 右侧: 属性面板 + 潮流结果
-- 顶部: 工具栏(运行潮流/清空)
+app.py — Main program entry.
+Layout: left palette / centre canvas / right properties.
+Toolbar: run power flow / clear / load demo / save+load topology.
+Component creation happens via drag-and-drop from the palette onto the
+canvas (handled in canvas.py: CircuitView.dropEvent). The MainWindow
+only wires signals and owns the Network.
 """
 from __future__ import annotations
 import sys
-from typing import Optional
 
 from PyQt5.QtCore import Qt
 from PyQt5.QtGui import QKeySequence
 from PyQt5.QtWidgets import (
-    QApplication, QMainWindow, QWidget, QHBoxLayout, QVBoxLayout,
-    QAction, QMessageBox, QSplitter, QLabel, QStatusBar, QShortcut,
-    QPushButton, QToolBar, QFileDialog
+    QApplication, QMainWindow, QAction, QMessageBox, QSplitter,
+    QStatusBar, QShortcut, QToolBar, QFileDialog
 )
 
 from solver import Network, run_power_flow
@@ -29,27 +28,20 @@ class MainWindow(QMainWindow):
         self.setWindowTitle("潮流计算 GUI  ·  pandapower 内核")
         self.resize(1280, 800)
 
-        # 网络 + 场景
+        # Network + scene + view
         self.network = Network()
         self.scene = CircuitScene(self.network)
         self.view = CircuitView(self.scene)
+        self.scene.set_view(self.view)  # optional; absent in older canvas
 
         self.palette = ComponentPalette()
         self.properties = PropertiesPanel()
         self.properties.attach_scene(self.scene)
 
-        # 选中变化 -> 刷新属性面板
+        # Selection -> property panel
         self.scene.selectionChanged.connect(self._on_selection_changed)
 
-        # 元件库点击 -> 进入"待放置"模式
-        self._pending_kind: Optional[str] = None
-        self.palette.component_chosen.connect(self._on_choose_component)
-
-        # 画布点击 -> 如果有待放置元件, 在点击位置创建
-        self.view.mousePressEvent_orig = self.view.mousePressEvent
-        self.view.mousePressEvent = self._on_canvas_press
-
-        # 布局
+        # Layout
         splitter = QSplitter(Qt.Horizontal)
         splitter.addWidget(self.palette)
         splitter.addWidget(self.view)
@@ -60,7 +52,7 @@ class MainWindow(QMainWindow):
         splitter.setSizes([150, 800, 260])
         self.setCentralWidget(splitter)
 
-        # 工具栏
+        # Toolbar
         toolbar = QToolBar()
         self.addToolBar(toolbar)
         act_run = QAction("▶ 运行潮流", self)
@@ -81,56 +73,16 @@ class MainWindow(QMainWindow):
         act_load.triggered.connect(self._load_topology)
         toolbar.addAction(act_load)
 
-        # 状态栏
+        # Status bar
         self.status = QStatusBar()
         self.setStatusBar(self.status)
-        self.status.showMessage("就绪 — 从左侧拖入元件到画布")
+        self.status.showMessage("Ready — drag a component from the left into the canvas")
 
-        # 快捷键
+        # Shortcuts
         QShortcut(QKeySequence("Ctrl+R"), self, activated=self._run_power_flow)
         QShortcut(QKeySequence("Ctrl+L"), self, activated=self._load_demo)
 
-        # 提示标签: 中央叠加显示"放置中: 元件名"
-        self._place_hint = QLabel("", self)
-        self._place_hint.setStyleSheet(
-            "background:#fff8d8; color:#806000; padding:6px 12px; border:1px solid #d0c080;"
-            "border-radius:6px; font-weight:bold;"
-        )
-        self._place_hint.hide()
-
-    # ---------- 元件放置 ----------
-    def _on_choose_component(self, kind: str):
-        self._pending_kind = kind
-        self._place_hint.setText(f"放置中: {kind} — 在画布上点击要放置的位置 (再次点击元件库取消)")
-        self._place_hint.adjustSize()
-        self._place_hint.move(20, 20)
-        self._place_hint.show()
-
-    def _on_canvas_press(self, event):
-        # 拦截画布按下: 如果有待放置元件, 在该点创建
-        if event.button() == Qt.LeftButton and self._pending_kind is not None:
-            # 必须点中空白, 而不是已有的元件 / 端口
-            scene_pos = self.view.mapToScene(event.pos())
-            item = self.view.itemAt(event.pos())
-            from canvas import PortItem, BaseComponent
-            if isinstance(item, (PortItem, BaseComponent)):
-                # 落到已有元件上 → 走默认逻辑 (可能要连线)
-                self._pending_kind = None
-                self._place_hint.hide()
-                self.view.mousePressEvent_orig(event)
-                return
-            kind = self._pending_kind
-            self._pending_kind = None
-            self._place_hint.hide()
-            comp = self.scene.add_component(kind, scene_pos.x(), scene_pos.y())
-            self.scene.clearSelection()
-            comp.setSelected(True)
-            event.accept()
-            self.status.showMessage(f"已创建 {kind}  {comp.model.name}", 3000)
-            return
-        self.view.mousePressEvent_orig(event)
-
-    # ---------- 选中事件 ----------
+    # ---------- Selection ----------
     def _on_selection_changed(self):
         sel = self.scene.selectedItems()
         if not sel:
@@ -142,7 +94,7 @@ class MainWindow(QMainWindow):
         elif isinstance(item, ConnectionItem):
             self.properties.show_connection(item)
 
-    # ---------- 工具栏动作 ----------
+    # ---------- Toolbar actions ----------
     def _run_power_flow(self):
         ok, err = run_power_flow(self.network)
         if not ok:
@@ -151,13 +103,12 @@ class MainWindow(QMainWindow):
             self.status.showMessage(f"❌ {err}", 5000)
             return False, err
         self.scene.refresh_results()
-        # 更新属性面板的结果区
         if self.properties.current_item is not None:
             self.properties.refresh_results()
         n_bus = len(self.network.buses)
         n_line = len(self.network.lines)
         self.status.showMessage(
-            f"✅ 潮流收敛 — 母线 {n_bus}, 线路 {n_line}", 5000
+            f"✅ Converged — buses {n_bus}, lines {n_line}", 5000
         )
         return True, ""
 
@@ -165,7 +116,7 @@ class MainWindow(QMainWindow):
         has_any = (self.network.buses or self.network.gens or self.network.loads
                    or self.network.lines or self.network.trafos or self.network.impedances)
         if has_any:
-            # 在无头环境(CI/offscreen 测试)下默认 yes, 避免弹窗阻塞
+            # In headless tests, default to yes to avoid the dialog blocking.
             if self.isVisible():
                 r = QMessageBox.question(
                     self, "清空画布", "确认清空当前所有元件?",
@@ -235,13 +186,13 @@ class MainWindow(QMainWindow):
             self.network.trafos[t["uid"]] = TrafoBranch(**t)
         for i in data.get("impedances", []):
             self.network.impedances[i["uid"]] = ImpedanceBranch(**i)
-        # 重建画布
+        # Rebuild canvas
         self._rebuild_scene_from_network()
         self.status.showMessage(f"已载入 {path}", 4000)
 
     def _rebuild_scene_from_network(self):
         from canvas import BusItem, GenItem, LoadItem, TrafoItem, ImpedanceItem, ConnectionItem
-        # 元件
+        # Components
         for uid, b in self.network.buses.items():
             it = BusItem(b)
             it.setPos(b.x, b.y)
@@ -275,13 +226,12 @@ class MainWindow(QMainWindow):
             it.setPos((a.x + b.x) / 2 - 40, (a.y + b.y) / 2 - 25)
             self.scene.addItem(it)
             self.scene._comp_by_uid[uid] = it
-        # 线路: 母线之间画连线
+        # Lines between buses
         for uid, ln in self.network.lines.items():
             a = self.scene._comp_by_uid.get(ln.from_bus)
             b = self.scene._comp_by_uid.get(ln.to_bus)
             if a is None or b is None:
                 continue
-            # 取左右最近端口
             pa = a.port_item("right")
             pb = b.port_item("left")
             if pa is None or pb is None:
@@ -295,17 +245,17 @@ class MainWindow(QMainWindow):
             self.scene._connections.append(conn)
 
     def _load_demo(self):
-        """加载一个 3 母线示例: B1(电源)--B2(负荷1)--B3(负荷2)"""
+        """Load a 3-bus demo: B1(gen)--B2(load1)--B3(load2)."""
         self._clear_canvas()
-        # 3 个母线
+        # 3 buses
         self.scene.add_component("Bus", 200, 300, "B1")
         self.scene.add_component("Bus", 500, 200, "B2")
         self.scene.add_component("Bus", 500, 450, "B3")
-        # 电源 + 负荷
+        # Generator + loads
         self.scene.add_component("Gen", 250, 200, "G1")
         self.scene.add_component("Load", 600, 150, "L1")
         self.scene.add_component("Load", 600, 400, "L2")
-        # 线路: B1-B2, B1-B3
+        # Lines: B1-B2, B1-B3
         from canvas import ConnectionItem
         b1 = next(it for uid, it in self.scene._comp_by_uid.items()
                   if self.network.buses[uid].name == "B1")
@@ -317,7 +267,7 @@ class MainWindow(QMainWindow):
             pa = a.port_item("right")
             pb = b.port_item("left")
             self.scene.create_connection(a, pa, b, pb)
-        # 自动跑一次潮流
+        # Auto-run power flow once
         self._run_power_flow()
         self.status.showMessage("已加载 3 母线示例 — 可点 ▶ 重新运行", 4000)
 

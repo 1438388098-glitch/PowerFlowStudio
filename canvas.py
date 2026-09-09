@@ -339,8 +339,9 @@ class ConnectionItem(QGraphicsPathItem):
 # ============================================================
 
 class CircuitView(QGraphicsView):
-    """QGraphicsView 子类: 处理鼠标交互"""
-    element_selected = pyqtSignal(object)   # 选中某元件/连线 时发出, 传 model(或 None)
+    """QGraphicsView subclass: handles mouse interaction AND drops from
+    the left-side component palette."""
+    element_selected = pyqtSignal(object)   # selected component/connection model, or None
 
     def __init__(self, scene: QGraphicsScene, parent=None):
         super().__init__(scene, parent)
@@ -349,9 +350,54 @@ class CircuitView(QGraphicsView):
         self.setMouseTracking(True)
         self._pending_port: Optional[PortItem] = None
         self._rubber_line: Optional[QGraphicsPathItem] = None
+        # Accept drops from the component palette.
+        self.setAcceptDrops(True)
+        self._drag_kind: Optional[str] = None  # kind while a drag is over us
 
+    # ---- Drag and drop ----
+    def dragEnterEvent(self, event):
+        if event.mimeData().hasFormat("application/x-powerflow-component"):
+            kind = bytes(event.mimeData().data("application/x-powerflow-component")).decode("utf-8")
+            self._drag_kind = kind
+            event.acceptProposedAction()
+        else:
+            event.ignore()
+
+    def dragMoveEvent(self, event):
+        if event.mimeData().hasFormat("application/x-powerflow-component"):
+            event.acceptProposedAction()
+        else:
+            event.ignore()
+
+    def dragLeaveEvent(self, event):
+        self._drag_kind = None
+        super().dragLeaveEvent(event)
+
+    def dropEvent(self, event):
+        # Prefer the cached kind from dragEnter, but fall back to reading
+        # the MIME payload directly — that way, if any drag event was lost
+        # (focus change, modifier toggle), we still recover the kind.
+        kind = self._drag_kind
+        if not kind and event.mimeData().hasFormat("application/x-powerflow-component"):
+            kind = bytes(event.mimeData().data("application/x-powerflow-component")).decode("utf-8")
+        self._drag_kind = None
+        if not kind:
+            event.ignore()
+            return
+        scene_pos = self.mapToScene(event.pos())
+        comp = self.scene().add_component(kind, scene_pos.x(), scene_pos.y())
+        self.scene().clearSelection()
+        if comp is not None:
+            comp.setSelected(True)
+            event.acceptProposedAction()
+            if hasattr(self.scene(), "_on_drop"):
+                self.scene()._on_drop(comp, kind)
+        else:
+            event.ignore()
+
+    # ---- Mouse interaction ----
     def mousePressEvent(self, event):
-        # 左键点端口 → 开始画连接
+        # Left-click on a port -> start drawing a connection
         if event.button() == Qt.LeftButton:
             item = self.itemAt(event.pos())
             if isinstance(item, PortItem):
@@ -379,7 +425,7 @@ class CircuitView(QGraphicsView):
         if self._pending_port and self._rubber_line:
             target = self.itemAt(event.pos())
             if isinstance(target, PortItem) and target is not self._pending_port:
-                # 找两个端口所属的元件
+                # Find the two components the ports belong to
                 a_item = self._pending_port.parentItem()
                 b_item = target.parentItem()
                 if a_item is not b_item:
@@ -392,7 +438,7 @@ class CircuitView(QGraphicsView):
         super().mouseReleaseEvent(event)
 
     def keyPressEvent(self, event):
-        # Delete / Backspace 删除选中
+        # Delete / Backspace deletes the selection
         if event.key() in (Qt.Key_Delete, Qt.Key_Backspace):
             for it in list(self.scene().selectedItems()):
                 self.scene().delete_item(it)
@@ -423,6 +469,20 @@ class CircuitScene(QGraphicsScene):
         self._comp_by_uid: Dict[str, BaseComponent] = {}
         self._connections: List[ConnectionItem] = []
         self.selection_changed_handler = None
+        self._view = None  # set by set_view() after construction
+
+    def set_view(self, view):
+        """Optional back-reference so drop / scene events can reach the view
+        (and through it, the status bar)."""
+        self._view = view
+
+    def _on_drop(self, comp, kind):
+        """Hook called by CircuitView.dropEvent after a successful drop."""
+        name = getattr(comp.model, "name", "?")
+        if self._view is not None and hasattr(self._view, "window"):
+            win = self._view.window()
+            if hasattr(win, "status"):
+                win.status.showMessage(f"已创建 {kind}  {name}", 3000)
 
     # ------- 元件创建 / 删除 -------
     def add_component(self, kind: str, x: float, y: float, name: Optional[str] = None):
