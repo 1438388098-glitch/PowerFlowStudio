@@ -58,7 +58,7 @@ def voltage_color(v_pu: Optional[float]) -> QColor:
 # ============================================================
 
 class PortItem(QGraphicsEllipseItem):
-    """元件上的端口点(用于连接), 8x8 的圆点"""
+    """A connection port on a component (small circle). 8x8."""
     def __init__(self, parent_item: "BaseComponent", port_id: str):
         super().__init__(-4, -4, 8, 8, parent_item)
         self.port_id = port_id
@@ -66,6 +66,29 @@ class PortItem(QGraphicsEllipseItem):
         self.setPen(QPen(Qt.black, 1))
         self.setFlag(QGraphicsItem.ItemIsSelectable, False)
         self.setCursor(Qt.CrossCursor)
+        # Ports must receive mouse events even when the view is in
+        # RubberBandDrag mode. RubberBandDrag intercepts mousePress at
+        # the QGraphicsView level; without these flags a click on the
+        # port would either start a rubber-band or be silently consumed
+        # by the parent item — neither of which lets us start drawing
+        # a connection line.
+        self.setFlag(QGraphicsItem.ItemHasNoContents, False)
+        self.setAcceptedMouseButtons(Qt.LeftButton)
+
+    def mousePressEvent(self, event):
+        # Hand control back to the view so it can begin drawing a
+        # connection. The view looks up its own _pending_port from
+        # scene().itemAt() (or directly from this item via the event
+        # position), but we set a flag on the scene so the view can
+        # find us without ambiguity.
+        if event.button() == Qt.LeftButton:
+            scene = self.scene()
+            view = scene.views()[0] if scene.views() else None
+            if view is not None and hasattr(view, "_start_connection_from_port"):
+                view._start_connection_from_port(self, event)
+                event.accept()
+                return
+        super().mousePressEvent(event)
 
 
 class BaseComponent(QGraphicsItem):
@@ -346,7 +369,13 @@ class CircuitView(QGraphicsView):
     def __init__(self, scene: QGraphicsScene, parent=None):
         super().__init__(scene, parent)
         self.setRenderHint(QPainter.Antialiasing)
-        self.setDragMode(QGraphicsView.RubberBandDrag)
+        # IMPORTANT: do NOT use RubberBandDrag. With RubberBandDrag active,
+        # the QGraphicsView intercepts mousePress at the view level before
+        # our overrides can see it, and clicks on PortItem either start a
+        # rubber-band selection or get silently consumed. We do selection
+        # manually by clicking components instead. ScrollDrag is the right
+        # mode here: middle-button drag pans, no automatic selection box.
+        self.setDragMode(QGraphicsView.ScrollHandDrag)
         self.setMouseTracking(True)
         self._pending_port: Optional[PortItem] = None
         self._rubber_line: Optional[QGraphicsPathItem] = None
@@ -413,16 +442,20 @@ class CircuitView(QGraphicsView):
         if event.button() == Qt.LeftButton:
             item = self.itemAt(event.pos())
             if isinstance(item, PortItem):
-                self._pending_port = item
-                path = QPainterPath(item.scenePos())
-                path.lineTo(self.mapToScene(event.pos()))
-                self._rubber_line = QGraphicsPathItem(path)
-                self._rubber_line.setPen(QPen(Qt.darkGray, 1.5))
-                self._rubber_line.setZValue(-2)
-                self.scene().addItem(self._rubber_line)
+                self._start_connection_from_port(item, event)
                 event.accept()
                 return
         super().mousePressEvent(event)
+
+    def _start_connection_from_port(self, port, event):
+        """Initialise rubber-band state for drawing a connection from `port`."""
+        self._pending_port = port
+        path = QPainterPath(port.scenePos())
+        path.lineTo(self.mapToScene(event.pos()))
+        self._rubber_line = QGraphicsPathItem(path)
+        self._rubber_line.setPen(QPen(Qt.darkGray, 1.5))
+        self._rubber_line.setZValue(-2)
+        self.scene().addItem(self._rubber_line)
 
     def mouseMoveEvent(self, event):
         if self._pending_port and self._rubber_line:
@@ -435,6 +468,9 @@ class CircuitView(QGraphicsView):
 
     def mouseReleaseEvent(self, event):
         if self._pending_port and self._rubber_line:
+            # Find the item under the cursor, but make sure we hit an
+            # actual port — PortItem mouseMove events from dragging the
+            # cursor over the source port itself should not self-connect.
             target = self.itemAt(event.pos())
             if isinstance(target, PortItem) and target is not self._pending_port:
                 # Find the two components the ports belong to
