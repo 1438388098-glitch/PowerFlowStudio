@@ -416,7 +416,7 @@ class CircuitView(QGraphicsView):
             event.ignore()
             return
         try:
-            scene_pos = self.mapToScene(event.pos())
+            scene_pos = self.mapToScene(event.pos().toPoint() if hasattr(event.pos(), "toPoint") else event.pos())
             x, y = float(scene_pos.x()), float(scene_pos.y())
             if not (x == x and y == y):  # NaN guard
                 event.ignore()
@@ -442,7 +442,10 @@ class CircuitView(QGraphicsView):
     def mousePressEvent(self, event):
         # Left-click on a port -> start drawing a connection
         if event.button() == Qt.LeftButton:
-            item = self.itemAt(event.pos())
+            # QGraphicsView.itemAt() takes QPoint (int). event.pos()
+            # returns QPointF in PyQt5; convert if needed.
+            pt = event.pos()
+            item = self.itemAt(pt.toPoint() if hasattr(pt, "toPoint") else pt)
             if isinstance(item, PortItem):
                 self._start_connection_from_port(item, event)
                 event.accept()
@@ -453,7 +456,9 @@ class CircuitView(QGraphicsView):
         """Initialise rubber-band state for drawing a connection from `port`."""
         self._pending_port = port
         path = QPainterPath(port.scenePos())
-        path.lineTo(self.mapToScene(event.pos()))
+        # QGraphicsView.mapToScene accepts QPoint (int). event.pos() can be
+        # QPoint or QPointF depending on PyQt5 version, so normalise.
+        path.lineTo(self.mapToScene(event.pos().toPoint() if hasattr(event.pos(), "toPoint") else event.pos()))
         self._rubber_line = QGraphicsPathItem(path)
         self._rubber_line.setPen(QPen(Qt.darkGray, 1.5))
         self._rubber_line.setZValue(-2)
@@ -462,7 +467,7 @@ class CircuitView(QGraphicsView):
     def mouseMoveEvent(self, event):
         if self._pending_port and self._rubber_line:
             path = QPainterPath(self._pending_port.scenePos())
-            path.lineTo(self.mapToScene(event.pos()))
+            path.lineTo(self.mapToScene(event.pos().toPoint() if hasattr(event.pos(), "toPoint") else event.pos()))
             self._rubber_line.setPath(path)
             event.accept()
             return
@@ -475,7 +480,7 @@ class CircuitView(QGraphicsView):
             # of the port dot itself. If we hit a BaseComponent, walk
             # to its nearest port to the cursor; only ignore if we hit
             # something unrelated (e.g. another rubber-line, empty area).
-            target = self._find_release_target(event.pos())
+            target = self._find_release_target(QPointF(event.pos()))
             if isinstance(target, PortItem) and target is not self._pending_port:
                 # Find the two components the ports belong to
                 a_item = self._pending_port.parentItem()
@@ -496,8 +501,10 @@ class CircuitView(QGraphicsView):
         If they released on a label or some other child, walk up to the
         owning component first.
         """
-        scene_pt = self.mapToScene(view_pos)
-        item = self.itemAt(view_pos)
+        scene_pt = self.mapToScene(view_pos.toPoint() if hasattr(view_pos, "toPoint") else view_pos)
+        # QGraphicsView.itemAt takes QPoint (int) — round QPointF if needed.
+        vp = view_pos.toPoint() if hasattr(view_pos, "toPoint") else view_pos
+        item = self.itemAt(vp)
         # Common case: user released on the port itself.
         if isinstance(item, PortItem):
             return item
@@ -691,11 +698,9 @@ class CircuitScene(QGraphicsScene):
             # 左端 p1 -> hv, 右端 p2 -> lv (trafo) / from(imp)
             if a_port.port_id == "p1" or a_port.port_id == "left" or a_port.port_id == "top":
                 # 母线接到了 comp 的左侧/上方
-                if comp.model.KIND == "Trafo" if hasattr(comp.model, "KIND") else False:
-                    pass
                 # 直接通过端口位置判断: a 在 comp 左边就接到 comp 的 p1 端口
                 # 我们把母线 uid 写进 model 字段
-                if comp.model.KIND == "Trafo" or isinstance(comp, TrafoItem):
+                if isinstance(comp, TrafoItem):
                     if a_port.scenePos().x() < comp.scenePos().x() + comp.W / 2:
                         comp.model.hv_bus = a_item.model.uid
                     else:
