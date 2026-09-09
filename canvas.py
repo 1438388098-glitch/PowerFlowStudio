@@ -201,11 +201,11 @@ class BusItem(BaseComponent):
             pen = QPen(Qt.red, 3)
         painter.setPen(pen)
         painter.drawRoundedRect(rect, 6, 6)
-        # 画 "≡" 母线符号
+        # 画 "≡" 母线符号 — use QLineF so float coords work
         painter.setPen(QPen(Qt.black, 2))
         for i in range(3):
             y = self.H * 0.3 + i * (self.H * 0.2)
-            painter.drawLine(self.W * 0.15, y, self.W * 0.85, y)
+            painter.drawLine(QLineF(self.W * 0.15, y, self.W * 0.85, y))
         # 电压数值
         if v_pu is not None:
             txt = f"{v_pu:.3f} pu"
@@ -283,7 +283,9 @@ class LineCompItem(BaseComponent):
         painter.setPen(QPen(self.LINE_COLOR, 3))
         if self.isSelected():
             painter.setPen(QPen(Qt.red, 4))
-        painter.drawLine(0, self.H / 2, self.W, self.H / 2)
+        # Use QLineF so the (H/2) float coordinate works under PyQt5
+        # (the (int, int, int, int) overload rejects float in PyQt5).
+        painter.drawLine(QLineF(0, self.H / 2, self.W, self.H / 2))
         # 中间标识
         rect = QRectF(self.W * 0.35, 4, self.W * 0.30, self.H - 8)
         painter.setBrush(QBrush(Qt.white))
