@@ -9,8 +9,8 @@ import pytest
 
 from solver import (
     Network, BusNode, GenUnit, LoadUnit,
-    LineBranch, TrafoBranch, ImpedanceBranch,
-    run_power_flow,
+    LineBranch, TrafoBranch, ImpedanceBranch, ShuntUnit,
+    run_power_flow, run_opf, run_short_circuit,
 )
 
 
@@ -370,3 +370,127 @@ class TestNegativeLoad:
         net_load_p = sum(net.load_p_mw.values())
         assert gen_p == pytest.approx(net_load_p, abs=5.0)
         assert gen_p > net_load_p   # 网损仍为正
+
+
+class TestLosses:
+    def test_total_loss_positive_and_consistent(self):
+        net = build_3bus_network()
+        ok, msg = run_power_flow(net)
+        assert ok, msg
+        assert net.total_loss_mw > 0
+        gen_p = sum(net.gen_p_mw.values())
+        load_p = sum(net.load_p_mw.values())
+        assert net.total_loss_mw == pytest.approx(gen_p - load_p, abs=1e-6)
+
+
+class TestShunt:
+    def test_shunt_build_and_result(self):
+        net = build_3bus_network()
+        from solver import ShuntUnit
+        net.shunts["c1"] = ShuntUnit(uid="c1", name="C1", bus_uid="b2",
+                                     q_mvar=-10.0)   # 电容器
+        ok, msg = run_power_flow(net)
+        assert ok, msg
+        assert "c1" in net.shunt_q_mvar
+        # 电容器抬高挂接点电压 (与不装相比)
+        v_with = net.bus_voltage_pu["b2"]
+        net.shunts.clear()
+        ok2, _ = run_power_flow(net)
+        assert ok2
+        assert v_with > net.bus_voltage_pu["b2"], "并联电容应抬高母线电压"
+
+    def test_reactor_lowers_voltage(self):
+        from solver import ShuntUnit
+        net = build_3bus_network()
+        net.loads["l1"].p_mw = 0
+        net.loads["l1"].q_mvar = 0
+        net.shunts["r1"] = ShuntUnit(uid="r1", name="R1", bus_uid="b2",
+                                     q_mvar=20.0)   # 电抗器吸收无功
+        ok, _ = run_power_flow(net)
+        assert ok
+        v_with = net.bus_voltage_pu["b2"]
+        net.shunts.clear()
+        run_power_flow(net)
+        assert v_with < net.bus_voltage_pu["b2"], "并联电抗应拉低母线电压"
+
+
+class TestTapPos:
+    def test_tap_changes_lv_voltage(self):
+        base = Network()
+        base.buses["hv"] = make_bus("hv", "HV", 0, 0, vn_kv=110.0)
+        base.buses["lv"] = make_bus("lv", "LV", 300, 0, vn_kv=35.0)
+        base.gens["g1"] = GenUnit(uid="g1", name="G1", bus_uid="hv", p_mw=50)
+        base.loads["l1"] = LoadUnit(uid="l1", name="L1", bus_uid="lv",
+                                    p_mw=20, q_mvar=8)
+        base.trafos["t1"] = TrafoBranch(uid="t1", name="T1",
+                                        hv_bus="hv", lv_bus="lv")
+        v_by_tap = {}
+        for tap in (0, 2):
+            base.trafos["t1"].tap_pos = tap
+            ok, msg = run_power_flow(base)
+            assert ok, msg
+            v_by_tap[tap] = base.bus_voltage_pu["lv"]
+        assert v_by_tap[2] != pytest.approx(v_by_tap[0], abs=1e-6), \
+            "分接头位置应改变低压侧电压"
+
+
+class TestOPF:
+    def build_2gen_cheap_expensive(self):
+        net = Network()
+        net.buses["b1"] = make_bus("b1", "B1", 0, 0)
+        net.buses["b2"] = make_bus("b2", "B2", 300, 0)
+        # 平衡节点: 贵机组, 兜底供电
+        net.gens["g1"] = GenUnit(uid="g1", name="贵电机", bus_uid="b1",
+                                 p_mw=10, vm_pu=1.0, cost_per_mw=100.0)
+        net.gens["g2"] = GenUnit(uid="g2", name="便宜电机", bus_uid="b2",
+                                 p_mw=20, vm_pu=1.0, cost_per_mw=1.0,
+                                 min_p_mw=0.0, max_p_mw=80.0)
+        net.loads["l1"] = LoadUnit(uid="l1", name="L1", bus_uid="b2",
+                                   p_mw=40, q_mvar=10)
+        net.lines["ln1"] = make_line("ln1", "线1", "b1", "b2")
+        return net
+
+    def test_opf_converges_and_dispatch_prefers_cheap(self):
+        net = self.build_2gen_cheap_expensive()
+        ok, msg = run_opf(net)
+        assert ok, msg
+        # 便宜电机顶到高出力, 贵的平衡节点少发
+        assert net.gen_p_mw["g2"] > 30.0, net.gen_p_mw
+        assert net.gen_p_mw["g1"] < 15.0, net.gen_p_mw
+
+    def test_opf_differs_from_nr_dispatch(self):
+        net = self.build_2gen_cheap_expensive()
+        run_power_flow(net)
+        p_nr = net.gen_p_mw["g2"]
+        run_opf(net)
+        assert net.gen_p_mw["g2"] > p_nr, "OPF 应让便宜机组多发"
+
+    def test_opf_on_case14(self):
+        from ieee_cases import load_case
+        net = load_case("case14")
+        ok, msg = run_opf(net)
+        assert ok, f"case14 OPF 应收敛: {msg}"
+        assert len(net.bus_voltage_pu) == 14
+
+
+class TestShortCircuit:
+    def test_ikss_all_buses_max_ge_min(self):
+        net = build_3bus_network()
+        ok, msg = run_short_circuit(net, case="max")
+        assert ok, msg
+        ik_max = dict(net.bus_ikss_ka)
+        assert len(ik_max) == 3
+        ok2, msg2 = run_short_circuit(net, case="min")
+        assert ok2, msg2
+        for uid in ik_max:
+            assert ik_max[uid] >= net.bus_ikss_ka[uid] > 0,                 "最大方式短路电流应 ≥ 最小方式"
+        # 距电源越远短路电流越小
+        assert ik_max["b1"] > ik_max["b2"]
+
+    def test_sc_clears_flow_results(self):
+        net = build_3bus_network()
+        run_power_flow(net)
+        assert net.line_p_from_mw
+        run_short_circuit(net)
+        assert not net.line_p_from_mw, "短路计算应清空潮流结果(互斥显示)"
+        assert net.bus_ikss_ka

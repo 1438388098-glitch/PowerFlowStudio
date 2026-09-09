@@ -26,8 +26,9 @@ from PyQt5.QtWidgets import (
 )
 
 from solver import (
-    Network, run_power_flow, _RESULT_FIELDS,
+    Network, run_power_flow, run_opf, run_short_circuit, _RESULT_FIELDS,
     BusNode, GenUnit, LoadUnit, LineBranch, TrafoBranch, ImpedanceBranch,
+    ShuntUnit,
 )
 from canvas import CircuitScene, CircuitView, BaseComponent, ConnectionItem
 import pandapower as pp
@@ -87,7 +88,7 @@ from results import (  # noqa: F401  再导出, 对外接口与拆分前一致
 _TOPO_SPEC = [
     ("buses", BusNode), ("gens", GenUnit), ("loads", LoadUnit),
     ("lines", LineBranch), ("trafos", TrafoBranch),
-    ("impedances", ImpedanceBranch),
+    ("impedances", ImpedanceBranch), ("shunts", ShuntUnit),
 ]
 
 
@@ -148,6 +149,7 @@ def network_to_json_dict(net: Network) -> dict:
         "lines": [asdict(l) for l in net.lines.values()],
         "trafos": [asdict(t) for t in net.trafos.values()],
         "impedances": [asdict(i) for i in net.impedances.values()],
+        "shunts": [asdict(s) for s in net.shunts.values()],
     }
 
 
@@ -291,6 +293,17 @@ class MainWindow(QMainWindow):
         menu_run.addAction("★ 3 母线示例", self._load_demo)
         menu_run.addAction("⚡ 两端供电示例", self._load_two_end_demo)
         menu_run.addAction("⛏ N-1 校核(逐条开断)", self._run_n_minus_1)
+        act_opf = QAction("🎯 OPF 最优潮流", self)
+        act_opf.setStatusTip("以发电成本最小为目标优化各机组出力 (属性面板可设成本与出力上下限)")
+        act_opf.triggered.connect(self._run_opf)
+        menu_run.addAction(act_opf)
+        menu_sc = menu_run.addMenu("三相短路计算")
+        act_sc_max = QAction("最大运行方式", self)
+        act_sc_max.triggered.connect(lambda: self._run_short_circuit("max"))
+        menu_sc.addAction(act_sc_max)
+        act_sc_min = QAction("最小运行方式", self)
+        act_sc_min.triggered.connect(lambda: self._run_short_circuit("min"))
+        menu_sc.addAction(act_sc_min)
         menu_run.addSeparator()
         for case_name, case_label in (("case14", "IEEE 14 母线"),
                                       ("case24_ieee_rts", "IEEE RTS-24 母线"),
@@ -549,6 +562,50 @@ class MainWindow(QMainWindow):
         item.setSelected(True)
         self.view.centerOn(item.scenePos())
 
+    def _run_opf(self):
+        """OPF 最优潮流: 成本最小化调度, 结果覆盖实际出力显示"""
+        t0 = time.perf_counter()
+        ok, err = run_opf(self.network)
+        elapsed_ms = (time.perf_counter() - t0) * 1000.0
+        if not ok:
+            if self.isVisible():
+                QMessageBox.warning(self, "OPF 计算失败", err)
+            self.status.showMessage(f"❌ {err}", 5000)
+            return False, err
+        self.network.converged = True
+        self.scene.refresh_results()
+        if self.properties.current_item is not None:
+            self.properties.refresh_results()
+        self.results_panel.refresh(self.network)
+        cost = sum((g.cost_per_mw or 0) * self.network.gen_p_mw.get(u, 0.0)
+                   for u, g in self.network.gens.items())
+        self.status.showMessage(
+            f"🎯 OPF 收敛 — 总发电成本 ≈ {cost:.0f}, 耗时 {elapsed_ms:.0f} ms "
+            "(机组实际出力即优化结果)", 6000)
+        return True, ""
+
+    def _run_short_circuit(self, case: str = "max"):
+        """三相短路计算: Ikss 写入母线结果 (电压等潮流结果会被清空)"""
+        t0 = time.perf_counter()
+        ok, err = run_short_circuit(self.network, case=case)
+        elapsed_ms = (time.perf_counter() - t0) * 1000.0
+        if not ok:
+            if self.isVisible():
+                QMessageBox.warning(self, "短路计算失败", err)
+            self.status.showMessage(f"❌ {err}", 5000)
+            return False, err
+        self.network.converged = True
+        self.scene.refresh_results()
+        if self.properties.current_item is not None:
+            self.properties.refresh_results()
+        ik = [v for v in self.network.bus_ikss_ka.values() if v == v]
+        if ik:
+            self.status.showMessage(
+                f"⚡ 短路计算[{case}] 完成 — Ikss 最大 {max(ik):.2f} kA "
+                f"(母线 {len(ik)} 条), 耗时 {elapsed_ms:.0f} ms "
+                "— 各母线属性面板可查", 8000)
+        return True, ""
+
     def _run_n_minus_1(self, interactive: bool = True):
         """N-1 校核: 逐条开断线路/变压器重跑潮流, 报告越限与孤立母线。
 
@@ -801,7 +858,8 @@ class MainWindow(QMainWindow):
 
     def _clear_canvas(self, skip_confirm=False):
         has_any = (self.network.buses or self.network.gens or self.network.loads
-                   or self.network.lines or self.network.trafos or self.network.impedances)
+                   or self.network.lines or self.network.trafos
+                   or self.network.impedances or self.network.shunts)
         if has_any and not skip_confirm:
             # In headless tests, default to yes to avoid the dialog blocking.
             if self.isVisible():
@@ -817,6 +875,7 @@ class MainWindow(QMainWindow):
         self.network.lines.clear()
         self.network.trafos.clear()
         self.network.impedances.clear()
+        self.network.shunts.clear()
         self.network.converged = False   # 画布清空后不应残留"已收敛"状态
         self._results_ever_shown = False
         if hasattr(self.scene, "_internal_links"):
@@ -901,6 +960,7 @@ class MainWindow(QMainWindow):
         self.network.lines.update(net.lines)
         self.network.trafos.update(net.trafos)
         self.network.impedances.update(net.impedances)
+        self.network.shunts.update(net.shunts)
         self._rebuild_scene_from_network()
         self._refresh_stats()
 

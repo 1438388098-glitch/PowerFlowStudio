@@ -35,6 +35,16 @@ class GenUnit:
     x: float = 0.0                 # 相对母线的偏移
     y: float = 0.0
     is_slack: bool = False         # 勾选后该机作为平衡节点(默认仍取第一台)
+    # ---- OPF 最优潮流 ----
+    min_p_mw: float = 0.0          # OPF 出力下限
+    max_p_mw: float = 100.0        # OPF 出力上限
+    cost_per_mw: float = 20.0      # 线性发电成本 (OPF 目标: 总成本最小)
+    # ---- 三相短路计算 (仅平衡节点参数进入 pandapower) ----
+    s_sc_max_mva: float = 5000.0   # 最大短路容量
+    s_sc_min_mva: float = 3000.0   # 最小短路容量
+    rx_max: float = 0.1            # R/X 比 (最大)
+    rx_min: float = 0.1
+    kappa: float = 1.5             # 峰值系数
 
 
 @dataclass
@@ -45,6 +55,18 @@ class LoadUnit:
     bus_uid: str
     p_mw: float = D.LOAD_P_MW
     q_mvar: float = D.LOAD_Q_MVAR
+    x: float = 0.0
+    y: float = 0.0
+
+
+@dataclass
+class ShuntUnit:
+    """并联电容/电抗器 (挂在母线上)"""
+    uid: str
+    name: str
+    bus_uid: str
+    p_mw: float = 0.0              # 有功损耗
+    q_mvar: float = 10.0           # 正=电抗器(吸收无功), 负=电容器(发出无功)
     x: float = 0.0
     y: float = 0.0
 
@@ -78,6 +100,7 @@ class TrafoBranch:
     pfe_kw: float = 0.0
     i0_percent: float = 0.0
     shift_degree: float = 0.0
+    tap_pos: int = 0               # 分接头位置 (-2..2, 0 为中性)
     x: float = 0.0                 # 画布坐标 (0,0 表示未记录, 载入时按中点摆放)
     y: float = 0.0
 
@@ -105,6 +128,7 @@ class Network:
     lines: Dict[str, LineBranch] = field(default_factory=dict)
     trafos: Dict[str, TrafoBranch] = field(default_factory=dict)
     impedances: Dict[str, ImpedanceBranch] = field(default_factory=dict)
+    shunts: Dict[str, ShuntUnit] = field(default_factory=dict)
 
     # 结果缓存(由 solver 写, 由画布层读)
     bus_voltage_pu: Dict[str, float] = field(default_factory=dict)
@@ -125,12 +149,20 @@ class Network:
     impedance_q_from_mvar: Dict[str, float] = field(default_factory=dict)
     impedance_p_to_mw: Dict[str, float] = field(default_factory=dict)
     impedance_q_to_mvar: Dict[str, float] = field(default_factory=dict)
+    # 并联电容/电抗器结果
+    shunt_p_mw: Dict[str, float] = field(default_factory=dict)
+    shunt_q_mvar: Dict[str, float] = field(default_factory=dict)
+    # 三相短路结果 (母线->Ikss kA)
+    bus_ikss_ka: Dict[str, float] = field(default_factory=dict)
     # Per-generator / per-load results (PV node's actual Q output, etc.)
     gen_p_mw: Dict[str, float] = field(default_factory=dict)
     gen_q_mvar: Dict[str, float] = field(default_factory=dict)
     gen_vm_pu: Dict[str, float] = field(default_factory=dict)
     load_p_mw: Dict[str, float] = field(default_factory=dict)
     load_q_mvar: Dict[str, float] = field(default_factory=dict)
+    # 汇总指标
+    total_loss_mw: float = 0.0
+    total_loss_q_mvar: float = 0.0
     converged: bool = False
     error_msg: str = ""
 
@@ -148,6 +180,8 @@ _RESULT_FIELDS = (
     "trafo_p_lv_mw", "trafo_q_lv_mvar",
     "impedance_p_from_mw", "impedance_q_from_mvar",
     "impedance_p_to_mw", "impedance_q_to_mvar",
+    "shunt_p_mw", "shunt_q_mvar",
+    "bus_ikss_ka",
     "gen_p_mw", "gen_q_mvar", "gen_vm_pu",
     "load_p_mw", "load_q_mvar",
 )
@@ -156,21 +190,25 @@ _RESULT_FIELDS = (
 def _clear_results(net: Network):
     for name in _RESULT_FIELDS:
         getattr(net, name).clear()
+    net.total_loss_mw = 0.0
+    net.total_loss_q_mvar = 0.0
     net.converged = False
     net.error_msg = ""
 
 
-def build_pandapower(net: Network) -> Tuple[pp.pandapowerNet, Dict[str, Dict]]:
+def build_pandapower(net: Network, for_opf: bool = False) -> Tuple[pp.pandapowerNet, Dict[str, Dict]]:
     """
     把画布拓扑转成 pandapower 网络对象。
 
-    返回 (pnet, id_maps)。id_maps 供 run_power_flow 把 pandapower 结果按
-    元件 uid 反向索引 —— 全程走 pp 内部 id, 与显示名无关, 元件重名不影响
-    结果归属:
+    for_opf=True 时: 发电机按可调度(带 min/max 出力与线性成本)建模,
+    供 run_opf 做最优潮流; 默认 False 保持纯潮流语义。
+
+    返回 (pnet, id_maps)。id_maps 供结果回写按元件 uid 反向索引:
       id_maps["bus"]       : uid -> pp bus id
       id_maps["line"]      : uid -> pp line id
       id_maps["trafo"]     : uid -> pp trafo id
       id_maps["impedance"] : uid -> pp impedance id
+      id_maps["shunt"]     : uid -> pp shunt id
       id_maps["ext"]       : pp ext_grid id -> gen uid (平衡节点)
       id_maps["gen"]       : pp gen id -> gen uid (PV 节点)
       id_maps["load"]      : pp load id -> load uid
@@ -181,7 +219,7 @@ def build_pandapower(net: Network) -> Tuple[pp.pandapowerNet, Dict[str, Dict]]:
 
     id_maps: Dict[str, Dict] = {
         "bus": {}, "line": {}, "trafo": {}, "impedance": {},
-        "ext": {}, "gen": {}, "load": {},
+        "shunt": {}, "ext": {}, "gen": {}, "load": {},
     }
     bus_id_map = id_maps["bus"]
 
@@ -201,18 +239,44 @@ def build_pandapower(net: Network) -> Tuple[pp.pandapowerNet, Dict[str, Dict]]:
             vm_pu=first_gen.vm_pu,
             name=first_gen.name,
         )
+        # 短路计算参数 (潮流不用, calc_sc 需要)
+        pnet.ext_grid.at[pp_id, "s_sc_max_mva"] = first_gen.s_sc_max_mva
+        pnet.ext_grid.at[pp_id, "s_sc_min_mva"] = first_gen.s_sc_min_mva
+        pnet.ext_grid.at[pp_id, "rx_max"] = first_gen.rx_max
+        pnet.ext_grid.at[pp_id, "rx_min"] = first_gen.rx_min
+        pnet.ext_grid.at[pp_id, "kappa"] = first_gen.kappa
         id_maps["ext"][pp_id] = first_gen_uid
         for uid in ordered[1:]:
             g = net.gens[uid]
-            pp_id = pp.create_gen(
-                pnet,
-                bus=bus_id_map[g.bus_uid],
-                p_mw=g.p_mw,
-                vm_pu=g.vm_pu,
-                name=g.name,
-                controllable=False,
-            )
+            if for_opf:
+                pp_id = pp.create_gen(
+                    pnet,
+                    bus=bus_id_map[g.bus_uid],
+                    p_mw=g.p_mw,
+                    vm_pu=g.vm_pu,
+                    name=g.name,
+                    controllable=True,
+                    min_p_mw=g.min_p_mw,
+                    max_p_mw=g.max_p_mw,
+                )
+            else:
+                pp_id = pp.create_gen(
+                    pnet,
+                    bus=bus_id_map[g.bus_uid],
+                    p_mw=g.p_mw,
+                    vm_pu=g.vm_pu,
+                    name=g.name,
+                    controllable=False,
+                )
             id_maps["gen"][pp_id] = uid
+        if for_opf:
+            # OPF 要求所有可调度元件都有成本函数(线性成本 cp1)
+            for pp_id, uid in id_maps["ext"].items():
+                pp.create_poly_cost(pnet, pp_id, et="ext_grid",
+                                    cp1_eur_per_mw=net.gens[uid].cost_per_mw)
+            for pp_id, uid in id_maps["gen"].items():
+                pp.create_poly_cost(pnet, pp_id, et="gen",
+                                    cp1_eur_per_mw=net.gens[uid].cost_per_mw)
 
     # 负荷
     for uid, ld in net.loads.items():
@@ -242,7 +306,8 @@ def build_pandapower(net: Network) -> Tuple[pp.pandapowerNet, Dict[str, Dict]]:
          "i0_percent": 0.0, "shift_degree": 0.0,
          "vector_group": "Dyn", "tap_side": "hv", "tap_neutral": 0,
          "tap_min": -2, "tap_max": 2, "tap_step_percent": 2.5,
-         "tap_pos": 0, "type": "transformer"},
+         "tap_pos": 0, "tap_changer_type": "Ratio",
+         "type": "transformer"},
         name="GUI_TRAFO",
         element="trafo",
     )
@@ -261,6 +326,7 @@ def build_pandapower(net: Network) -> Tuple[pp.pandapowerNet, Dict[str, Dict]]:
         pnet.line.at[idx, "x_ohm_per_km"] = ln.x_ohm_per_km
         pnet.line.at[idx, "c_nf_per_km"] = ln.c_nf_per_km
         pnet.line.at[idx, "max_i_ka"] = ln.max_i_ka
+        pnet.line.at[idx, "endtemp_degree"] = 70.0   # 短路计算(case=min)需要
         id_maps["line"][uid] = idx
 
     # 变压器
@@ -280,6 +346,7 @@ def build_pandapower(net: Network) -> Tuple[pp.pandapowerNet, Dict[str, Dict]]:
         pnet.trafo.at[idx, "pfe_kw"] = tr.pfe_kw
         pnet.trafo.at[idx, "i0_percent"] = tr.i0_percent
         pnet.trafo.at[idx, "shift_degree"] = tr.shift_degree
+        pnet.trafo.at[idx, "tap_pos"] = int(tr.tap_pos)
         id_maps["trafo"][uid] = idx
 
     # 串联阻抗
@@ -294,6 +361,17 @@ def build_pandapower(net: Network) -> Tuple[pp.pandapowerNet, Dict[str, Dict]]:
             name=imp.name,
         )
         id_maps["impedance"][uid] = idx
+
+    # 并联电容/电抗器
+    for uid, sh in net.shunts.items():
+        idx = pp.create_shunt(
+            pnet,
+            bus=bus_id_map[sh.bus_uid],
+            p_mw=sh.p_mw,
+            q_mvar=sh.q_mvar,
+            name=sh.name,
+        )
+        id_maps["shunt"][uid] = idx
 
     return pnet, id_maps
 
@@ -338,13 +416,7 @@ def run_power_flow(net: Network, algorithm: str = "nr") -> Tuple[bool, str]:
     """
     _clear_results(net)
 
-    if len(net.buses) < 1:
-        _fail(net, "画布上没有母线")
-        return False, net.error_msg
-    if len(net.gens) < 1:
-        _fail(net, "至少需要一个电源(发电机)作为平衡节点")
-        return False, net.error_msg
-    topo_err = _validate_topology(net)
+    topo_err = _validate_for_solve(net)
     if topo_err:
         _fail(net, topo_err)
         return False, net.error_msg
@@ -367,60 +439,7 @@ def run_power_flow(net: Network, algorithm: str = "nr") -> Tuple[bool, str]:
     # 结果按 uid 归属: bus/line/trafo 用 build 阶段记录的 uid -> pp id 映射,
     # gen/ext/load 用 pp id -> uid 映射。与元件显示名完全无关, 重名不错乱。
     try:
-        res_bus = pnet.res_bus
-        for uid, pp_id in id_maps["bus"].items():
-            if pp_id in res_bus.index:
-                vm_pu = float(res_bus.at[pp_id, "vm_pu"])
-                net.bus_voltage_pu[uid] = vm_pu
-                net.bus_voltage_kv[uid] = vm_pu * net.buses[uid].vn_kv
-                net.bus_va_degree[uid] = float(res_bus.at[pp_id, "va_degree"])
-
-        res_line = pnet.res_line
-        for uid, pp_id in id_maps["line"].items():
-            if pp_id in res_line.index:
-                net.line_loading_percent[uid] = float(res_line.at[pp_id, "loading_percent"])
-                net.line_p_from_mw[uid] = float(res_line.at[pp_id, "p_from_mw"])
-                net.line_q_from_mvar[uid] = float(res_line.at[pp_id, "q_from_mvar"])
-                net.line_p_to_mw[uid] = float(res_line.at[pp_id, "p_to_mw"])
-                net.line_q_to_mvar[uid] = float(res_line.at[pp_id, "q_to_mvar"])
-
-        res_trafo = pnet.res_trafo
-        for uid, pp_id in id_maps["trafo"].items():
-            if pp_id in res_trafo.index:
-                net.trafo_loading_percent[uid] = float(res_trafo.at[pp_id, "loading_percent"])
-                net.trafo_p_hv_mw[uid] = float(res_trafo.at[pp_id, "p_hv_mw"])
-                net.trafo_q_hv_mvar[uid] = float(res_trafo.at[pp_id, "q_hv_mvar"])
-                net.trafo_p_lv_mw[uid] = float(res_trafo.at[pp_id, "p_lv_mw"])
-                net.trafo_q_lv_mvar[uid] = float(res_trafo.at[pp_id, "q_lv_mvar"])
-
-        res_imp = getattr(pnet, "res_impedance", None)
-        if res_imp is not None:
-            for uid, pp_id in id_maps["impedance"].items():
-                if pp_id in res_imp.index:
-                    net.impedance_p_from_mw[uid] = float(res_imp.at[pp_id, "p_from_mw"])
-                    net.impedance_q_from_mvar[uid] = float(res_imp.at[pp_id, "q_from_mvar"])
-                    net.impedance_p_to_mw[uid] = float(res_imp.at[pp_id, "p_to_mw"])
-                    net.impedance_q_to_mvar[uid] = float(res_imp.at[pp_id, "q_to_mvar"])
-
-        # PV gens — actual Q output (the result, not an input)
-        for pp_id, uid in id_maps["gen"].items():
-            if pp_id in pnet.res_gen.index:
-                net.gen_p_mw[uid] = float(pnet.res_gen.at[pp_id, "p_mw"])
-                net.gen_q_mvar[uid] = float(pnet.res_gen.at[pp_id, "q_mvar"])
-                net.gen_vm_pu[uid] = float(pnet.res_gen.at[pp_id, "vm_pu"])
-        # Slack ext_grid — same fields, separate id space. The slack
-        # bus's V is an input, not a result, so we don't write vm_pu
-        # here (it stays at whatever the user set).
-        for pp_id, uid in id_maps["ext"].items():
-            if pp_id in pnet.res_ext_grid.index:
-                net.gen_p_mw[uid] = float(pnet.res_ext_grid.at[pp_id, "p_mw"])
-                net.gen_q_mvar[uid] = float(pnet.res_ext_grid.at[pp_id, "q_mvar"])
-        # Loads — confirmed P/Q (pandapower passes through, but useful for
-        # comparing against net.loads and detecting scaling issues)
-        for pp_id, uid in id_maps["load"].items():
-            if pp_id in pnet.res_load.index:
-                net.load_p_mw[uid] = float(pnet.res_load.at[pp_id, "p_mw"])
-                net.load_q_mvar[uid] = float(pnet.res_load.at[pp_id, "q_mvar"])
+        _extract_ac_results(net, pnet, id_maps)
     except Exception as e:
         _fail(net, f"读取结果错误: {type(e).__name__}: {e}")
         return False, net.error_msg
@@ -513,3 +532,178 @@ def format_n1_report(report: dict, loading_limit: float = 100.0) -> str:
     if not problem_lines:
         return header + "✓ 全部开断方式下无越限、无孤立母线。"
     return header + "\n".join(problem_lines)
+
+
+def _validate_for_solve(net: Network) -> str:
+    """run_power_flow / run_opf / run_short_circuit 共用的前置校验"""
+    if len(net.buses) < 1:
+        return "画布上没有母线"
+    if len(net.gens) < 1:
+        return "至少需要一个电源(发电机)作为平衡节点"
+    return _validate_topology(net)
+
+
+def _extract_ac_results(net: Network, pnet, id_maps):
+    """NR/OPF 共用的 AC 结果回写 (结果表列两模式一致)"""
+    res_bus = pnet.res_bus
+    for uid, pp_id in id_maps["bus"].items():
+        if pp_id in res_bus.index:
+            vm_pu = float(res_bus.at[pp_id, "vm_pu"])
+            net.bus_voltage_pu[uid] = vm_pu
+            net.bus_voltage_kv[uid] = vm_pu * net.buses[uid].vn_kv
+            net.bus_va_degree[uid] = float(res_bus.at[pp_id, "va_degree"])
+
+    res_line = pnet.res_line
+    for uid, pp_id in id_maps["line"].items():
+        if pp_id in res_line.index:
+            net.line_loading_percent[uid] = float(res_line.at[pp_id, "loading_percent"])
+            net.line_p_from_mw[uid] = float(res_line.at[pp_id, "p_from_mw"])
+            net.line_q_from_mvar[uid] = float(res_line.at[pp_id, "q_from_mvar"])
+            net.line_p_to_mw[uid] = float(res_line.at[pp_id, "p_to_mw"])
+            net.line_q_to_mvar[uid] = float(res_line.at[pp_id, "q_to_mvar"])
+
+    res_trafo = pnet.res_trafo
+    for uid, pp_id in id_maps["trafo"].items():
+        if pp_id in res_trafo.index:
+            net.trafo_loading_percent[uid] = float(res_trafo.at[pp_id, "loading_percent"])
+            net.trafo_p_hv_mw[uid] = float(res_trafo.at[pp_id, "p_hv_mw"])
+            net.trafo_q_hv_mvar[uid] = float(res_trafo.at[pp_id, "q_hv_mvar"])
+            net.trafo_p_lv_mw[uid] = float(res_trafo.at[pp_id, "p_lv_mw"])
+            net.trafo_q_lv_mvar[uid] = float(res_trafo.at[pp_id, "q_lv_mvar"])
+
+    res_imp = getattr(pnet, "res_impedance", None)
+    if res_imp is not None:
+        for uid, pp_id in id_maps["impedance"].items():
+            if pp_id in res_imp.index:
+                net.impedance_p_from_mw[uid] = float(res_imp.at[pp_id, "p_from_mw"])
+                net.impedance_q_from_mvar[uid] = float(res_imp.at[pp_id, "q_from_mvar"])
+                net.impedance_p_to_mw[uid] = float(res_imp.at[pp_id, "p_to_mw"])
+                net.impedance_q_to_mvar[uid] = float(res_imp.at[pp_id, "q_to_mvar"])
+
+    res_sh = getattr(pnet, "res_shunt", None)
+    if res_sh is not None:
+        for uid, pp_id in id_maps["shunt"].items():
+            if pp_id in res_sh.index:
+                net.shunt_p_mw[uid] = float(res_sh.at[pp_id, "p_mw"])
+                net.shunt_q_mvar[uid] = float(res_sh.at[pp_id, "q_mvar"])
+
+    for pp_id, uid in id_maps["gen"].items():
+        if pp_id in pnet.res_gen.index:
+            net.gen_p_mw[uid] = float(pnet.res_gen.at[pp_id, "p_mw"])
+            net.gen_q_mvar[uid] = float(pnet.res_gen.at[pp_id, "q_mvar"])
+            net.gen_vm_pu[uid] = float(pnet.res_gen.at[pp_id, "vm_pu"])
+    for pp_id, uid in id_maps["ext"].items():
+        if pp_id in pnet.res_ext_grid.index:
+            net.gen_p_mw[uid] = float(pnet.res_ext_grid.at[pp_id, "p_mw"])
+            net.gen_q_mvar[uid] = float(pnet.res_ext_grid.at[pp_id, "q_mvar"])
+    for pp_id, uid in id_maps["load"].items():
+        if pp_id in pnet.res_load.index:
+            net.load_p_mw[uid] = float(pnet.res_load.at[pp_id, "p_mw"])
+            net.load_q_mvar[uid] = float(pnet.res_load.at[pp_id, "q_mvar"])
+
+    # 网损汇总 (缺列防御)
+    loss_mw = 0.0
+    loss_q = 0.0
+    line_cols = set(pnet.res_line.columns)
+    if "pl_mw" in line_cols:
+        loss_mw += float(pnet.res_line["pl_mw"].fillna(0).sum())
+    if {"q_from_mvar", "q_to_mvar"} <= line_cols:
+        loss_q += float((pnet.res_line["q_from_mvar"].fillna(0)
+                         + pnet.res_line["q_to_mvar"].fillna(0)).sum())
+    if hasattr(pnet, "res_trafo"):
+        tcols = set(pnet.res_trafo.columns)
+        if "pl_mw" in tcols:
+            loss_mw += float(pnet.res_trafo["pl_mw"].fillna(0).sum())
+        if "ql_mvar" in tcols:
+            loss_q += float(pnet.res_trafo["ql_mvar"].fillna(0).sum())
+    net.total_loss_mw = loss_mw
+    net.total_loss_q_mvar = loss_q
+
+
+def run_opf(net: Network) -> Tuple[bool, str]:
+    """
+    最优潮流(OPF): 以线性发电成本最小为目标, 求各可控机组出力。
+    结果同样回写 net.gen_p_mw 等字段 (实际出力即优化解)。
+    """
+    _clear_results(net)
+
+    topo_err = _validate_for_solve(net)
+    if topo_err:
+        _fail(net, topo_err)
+        return False, net.error_msg
+
+    try:
+        pnet, id_maps = build_pandapower(net, for_opf=True)
+        pp.runopp(pnet, verbose=False)
+    except pp.LoadflowNotConverged as e:
+        _fail(net, f"OPF 不收敛: {e}")
+        return False, net.error_msg
+    except Exception as e:
+        _fail(net, f"OPF 计算错误: {type(e).__name__}: {e}")
+        return False, net.error_msg
+
+    try:
+        _extract_ac_results(net, pnet, id_maps)
+    except Exception as e:
+        _fail(net, f"读取 OPF 结果错误: {type(e).__name__}: {e}")
+        return False, net.error_msg
+
+    net.converged = True
+    return True, ""
+
+
+def run_short_circuit(net: Network, case: str = "max") -> Tuple[bool, str]:
+    """
+    三相对称短路计算: 母线短路电流 Ikss (kA) 回写到 net.bus_ikss_ka。
+    case: "max" 最大运行方式 / "min" 最小运行方式。
+    平衡节点发电机属性里有短路容量与 R/X、峰值系数参数。
+    """
+    _clear_results(net)
+
+    topo_err = _validate_for_solve(net)
+    if topo_err:
+        _fail(net, topo_err)
+        return False, net.error_msg
+
+    try:
+        from pandapower.shortcircuit import calc_sc
+        pnet, id_maps = build_pandapower(net)
+        # 短路计算自身要做一次潮流初始化
+        pp.runpp(pnet, algorithm="nr", init="flat", numba=False)
+        # PV 发电机参与短路: 按典型参数补齐 gen 表的短路列
+        # (额定电压取母线电压, 额定容量按 cosφ=0.85 由 P 折算, 次暂态电抗 18%)
+        for pp_id, uid in id_maps["gen"].items():
+            g = net.gens[uid]
+            vn = net.buses[g.bus_uid].vn_kv
+            sn = max(abs(g.p_mw) / 0.85, 10.0)
+            xdss, rdss = 18.0, 1.0
+            base_z = vn * vn / sn
+            pnet.gen.at[pp_id, "vn_kv"] = vn
+            pnet.gen.at[pp_id, "sn_mva"] = sn
+            pnet.gen.at[pp_id, "xdss_percent"] = xdss
+            pnet.gen.at[pp_id, "rdss_percent"] = rdss
+            pnet.gen.at[pp_id, "xdss_ohm"] = xdss / 100.0 * base_z
+            pnet.gen.at[pp_id, "rdss_ohm"] = rdss / 100.0 * base_z
+            pnet.gen.at[pp_id, "xdss_pu"] = xdss / 100.0
+            pnet.gen.at[pp_id, "rdss_pu"] = rdss / 100.0
+            pnet.gen.at[pp_id, "cos_phi"] = 0.85
+            pnet.gen.at[pp_id, "generator_type"] = "PV"
+        calc_sc(pnet, case=case, ip=False, topology="auto", lv_tol_percent=10)
+    except pp.LoadflowNotConverged as e:
+        _fail(net, f"短路计算前潮流不收敛: {e}")
+        return False, net.error_msg
+    except Exception as e:
+        _fail(net, f"短路计算错误: {type(e).__name__}: {e}")
+        return False, net.error_msg
+
+    try:
+        res_sc = pnet.res_bus_sc
+        for uid, pp_id in id_maps["bus"].items():
+            if pp_id in res_sc.index:
+                net.bus_ikss_ka[uid] = float(res_sc.at[pp_id, "ikss_ka"])
+    except Exception as e:
+        _fail(net, f"读取短路结果错误: {type(e).__name__}: {e}")
+        return False, net.error_msg
+
+    net.converged = True
+    return True, ""

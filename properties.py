@@ -57,12 +57,23 @@ class PropertiesPanel(QWidget):
             self._add_float(model, "p_mw", "有功 P (MW)", model.p_mw, 0, 5000, 1)
             self._add_float(model, "vm_pu", "电压 V (pu)", model.vm_pu, 0.8, 1.2, 4)
             self._add_check(model, "is_slack", "平衡节点 (Slack)")
+            self._add_float(model, "min_p_mw", "OPF 出力下限 (MW)", model.min_p_mw, -5000, 5000, 1)
+            self._add_float(model, "max_p_mw", "OPF 出力上限 (MW)", model.max_p_mw, 0, 5000, 1)
+            self._add_float(model, "cost_per_mw", "发电成本 (元/MWh)", model.cost_per_mw, 0, 10000, 1)
+            self._add_float(model, "s_sc_max_mva", "短路容量最大 (MVA)", model.s_sc_max_mva, 1, 100000, 0)
+            self._add_float(model, "s_sc_min_mva", "短路容量最小 (MVA)", model.s_sc_min_mva, 1, 100000, 0)
+            self._add_float(model, "kappa", "峰值系数 κ", model.kappa, 1.0, 2.0, 2)
         elif kind == "Load":
             self._add_name_field()
             self._add_combo_bus(model, "bus_uid", "挂接母线", model.bus_uid)
             # 负负荷 = 该点注入功率(等效电源), 允许为负
             self._add_float(model, "p_mw", "有功 P (MW)", model.p_mw, -5000, 5000, 1)
             self._add_float(model, "q_mvar", "无功 Q (Mvar)", model.q_mvar, -1000, 1000, 2)
+        elif kind == "Shunt":
+            self._add_name_field()
+            self._add_combo_bus(model, "bus_uid", "挂接母线", model.bus_uid)
+            self._add_float(model, "p_mw", "有功损耗 (MW)", model.p_mw, 0, 500, 3)
+            self._add_float(model, "q_mvar", "无功 (Mvar) 正电抗/负电容", model.q_mvar, -1000, 1000, 2)
         elif kind == "Trafo":
             self._add_name_field()
             self._add_combo_bus(model, "hv_bus", "高压母线", model.hv_bus)
@@ -74,6 +85,7 @@ class PropertiesPanel(QWidget):
             self._add_float(model, "vkr_percent", "电阻压降 (%)", model.vkr_percent, 0, 30, 3)
             self._add_float(model, "pfe_kw", "铁损 (kW)", model.pfe_kw, 0, 1000, 1)
             self._add_float(model, "i0_percent", "空载电流 (%)", model.i0_percent, 0, 10, 3)
+            self._add_int(model, "tap_pos", "分接头位置 (-2..2)", model.tap_pos, -2, 2)
         elif kind == "Impedance":
             self._add_name_field()
             self._add_combo_bus(model, "from_bus", "首端母线", model.from_bus)
@@ -188,6 +200,16 @@ class PropertiesPanel(QWidget):
         self.form_layout.addRow(label, cb)
         self._fields[attr] = cb
 
+    def _add_int(self, model, attr: str, label: str, value: int,
+                 mn: int, mx: int) -> None:
+        from PyQt5.QtWidgets import QSpinBox
+        sb = QSpinBox()
+        sb.setRange(mn, mx)
+        sb.setValue(int(value))
+        sb.valueChanged.connect(lambda v: self._set_attr(model, attr, int(v)))
+        self.form_layout.addRow(label, sb)
+        self._fields[attr] = sb
+
     def _add_check(self, model, attr: str, label: str) -> None:
         from PyQt5.QtWidgets import QCheckBox
         cb = QCheckBox()
@@ -210,7 +232,8 @@ class PropertiesPanel(QWidget):
             return
         net = scene.network
         item = self.current_item
-        from canvas import BaseComponent, ConnectionItem, BusItem, GenItem, LoadItem, TrafoItem, ImpedanceItem
+        from canvas import (BaseComponent, ConnectionItem, BusItem, GenItem,
+                            LoadItem, TrafoItem, ImpedanceItem, ShuntItem)
         if isinstance(item, BaseComponent):
             m = item.model
             if isinstance(item, BusItem):
@@ -220,6 +243,9 @@ class PropertiesPanel(QWidget):
                 self._add_result("电压 (pu)", f"{v:.4f}" if v is not None else "—")
                 self._add_result("电压 (kV)", f"{vk:.2f}" if vk is not None else "—")
                 self._add_result("相角 (°)", f"{a:.3f}" if a is not None else "—")
+                ik = net.bus_ikss_ka.get(m.uid)
+                if ik is not None:
+                    self._add_result("短路 Ikss (kA)", f"{ik:.3f}")
             elif isinstance(item, GenItem):
                 # PV node: P is input, V is input, Q is the result.
                 # Slack node: V and θ are input, P and Q are results.
@@ -254,6 +280,13 @@ class PropertiesPanel(QWidget):
                 self._show_trafo_results(m.uid)
             elif isinstance(item, ImpedanceItem):
                 self._show_impedance_results(m.uid)
+            elif isinstance(item, ShuntItem):
+                p = net.shunt_p_mw.get(m.uid)
+                q = net.shunt_q_mvar.get(m.uid)
+                v = net.bus_voltage_pu.get(m.bus_uid)
+                self._add_result("注入有功 (MW)", f"{p:+.3f}" if p is not None else "—")
+                self._add_result("注入无功 (Mvar)", f"{q:+.2f}" if q is not None else "—")
+                self._add_result("母线电压 (pu)", f"{v:.4f}" if v is not None else "—")
         elif isinstance(item, ConnectionItem):
             if item.kind == "Line" and item.uid in net.lines:
                 l = net.line_loading_percent.get(item.uid)

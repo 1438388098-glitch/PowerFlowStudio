@@ -19,7 +19,7 @@ from PyQt5.QtWidgets import (
 
 from solver import (
     Network, BusNode, GenUnit, LoadUnit,
-    LineBranch, TrafoBranch, ImpedanceBranch
+    LineBranch, TrafoBranch, ImpedanceBranch, ShuntUnit
 )
 import defaults as D
 
@@ -362,6 +362,35 @@ class ImpedanceItem(LineCompItem):
     SYMBOL = "Z"
 
 
+class ShuntItem(BaseComponent):
+    """并联电容/电抗器: 两条水平极板 + 引线"""
+    KIND = "Shunt"
+    HAS_PORTS = True
+    COLOR = QColor(32, 128, 128)
+    FILL = QColor(216, 240, 240)
+
+    def _init_ports(self):
+        self.add_port("in", self.W / 2, 0)   # 上端接母线
+
+    def paint(self, painter, option, widget):
+        painter.setRenderHint(QPainter.Antialiasing)
+        painter.setPen(self.selection_pen(QPen(self.COLOR, 2)))
+        # 引线: 顶部中点 → 极板区
+        plate_top = self.H * 0.45
+        painter.drawLine(QLineF(self.W / 2, 0, self.W / 2, plate_top - 7))
+        painter.drawLine(QLineF(self.W / 2, self.H, self.W / 2, plate_top + 7))
+        # 两块极板 (电容器符号)
+        w2 = self.W * 0.5
+        painter.drawLine(QLineF(self.W / 2 - w2 / 2, plate_top - 7,
+                                self.W / 2 + w2 / 2, plate_top - 7))
+        painter.drawLine(QLineF(self.W / 2 - w2 / 2, plate_top + 7,
+                                self.W / 2 + w2 / 2, plate_top + 7))
+        painter.setPen(QPen(Qt.black, 1))
+        painter.setFont(QFont("Arial", 9, QFont.Bold))
+        painter.drawText(QRectF(0, 0, self.W * 0.3, self.H),
+                         Qt.AlignCenter, "")
+
+
 def kind_of(item) -> str:
     """元件种类名 — 统一 isinstance 判断链的单一来源"""
     if isinstance(item, BusItem):
@@ -374,6 +403,8 @@ def kind_of(item) -> str:
         return "Trafo"
     if isinstance(item, ImpedanceItem):
         return "Impedance"
+    if isinstance(item, ShuntItem):
+        return "Shunt"
     return "Base"
 
 
@@ -747,6 +778,7 @@ class CircuitScene(QGraphicsScene):
             "Load": (self._make_load_model, self.network.loads, LoadItem, "L"),
             "Trafo": (self._make_trafo_model, self.network.trafos, TrafoItem, "T"),
             "Impedance": (self._make_impedance_model, self.network.impedances, ImpedanceItem, "Z"),
+            "Shunt": (self._make_shunt_model, self.network.shunts, ShuntItem, "C"),
         }
 
     # ---- 各元件的 model 工厂(自动绑定母线) ----
@@ -764,6 +796,12 @@ class CircuitScene(QGraphicsScene):
         if bus_uid is None:
             bus_uid = self._ensure_first_bus(x, y)
         return LoadUnit(uid=uid, name=name, bus_uid=bus_uid)
+
+    def _make_shunt_model(self, uid: str, name: str, x: float, y: float) -> ShuntUnit:
+        bus_uid = self._nearest_bus(x, y)
+        if bus_uid is None:
+            bus_uid = self._ensure_first_bus(x, y)
+        return ShuntUnit(uid=uid, name=name, bus_uid=bus_uid)
 
     def _make_trafo_model(self, uid: str, name: str, x: float, y: float) -> TrafoBranch:
         uid_a = self._nearest_bus(x, y - D.AUTO_BUS_OFFSET)
@@ -1005,11 +1043,13 @@ class CircuitScene(QGraphicsScene):
         if not getattr(self, "_clipboard", None):
             return 0
         model_cls = {"Bus": BusNode, "Gen": GenUnit, "Load": LoadUnit,
-                     "Trafo": TrafoBranch, "Impedance": ImpedanceBranch}
+                     "Trafo": TrafoBranch, "Impedance": ImpedanceBranch,
+                     "Shunt": ShuntUnit}
         containers = {"Bus": self.network.buses, "Gen": self.network.gens,
                       "Load": self.network.loads,
                       "Trafo": self.network.trafos,
-                      "Impedance": self.network.impedances}
+                      "Impedance": self.network.impedances,
+                      "Shunt": self.network.shunts}
         uid_map: Dict[str, str] = {}
         new_items: List[BaseComponent] = []
         for kind, mdict in self._clipboard["components"]:

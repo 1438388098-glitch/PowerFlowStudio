@@ -11,7 +11,7 @@ import csv
 from PyQt5.QtCore import Qt, pyqtSignal
 from PyQt5.QtWidgets import (
     QApplication, QWidget, QVBoxLayout, QTabWidget, QTableWidget,
-    QTableWidgetItem, QHeaderView
+    QTableWidgetItem, QHeaderView, QLabel
 )
 
 from solver import Network
@@ -32,6 +32,9 @@ class ResultsPanel(QWidget):
         self._branch_row_uids = []
         layout = QVBoxLayout(self)
         layout.setContentsMargins(2, 2, 2, 2)
+        self.loss_label = QLabel("")
+        self.loss_label.setStyleSheet("font-weight:bold;")
+        layout.addWidget(self.loss_label)
         self.tabs = QTabWidget()
         self.bus_table = QTableWidget()
         self.branch_table = QTableWidget()
@@ -100,6 +103,14 @@ class ResultsPanel(QWidget):
 
     # ---- 数据填充 ----
     def refresh(self, net: Network) -> None:
+        if net.total_loss_mw or net.total_loss_q_mvar:
+            load_p = sum(net.load_p_mw.values()) if net.load_p_mw else 0.0
+            pct = (net.total_loss_mw / abs(load_p) * 100) if load_p else 0.0
+            self.loss_label.setText(
+                f"总网损: {net.total_loss_mw:.3f} MW / "
+                f"{net.total_loss_q_mvar:.2f} Mvar ({pct:.2f}%)")
+        else:
+            self.loss_label.setText("")
         rows = [(b.name,
                  net.bus_voltage_pu.get(uid),
                  net.bus_voltage_kv.get(uid),
@@ -143,6 +154,10 @@ class ResultsPanel(QWidget):
             brows.append(("阻抗", im.name,
                           net.impedance_p_from_mw.get(uid),
                           net.impedance_q_from_mvar.get(uid), None))
+        for uid, sh in net.shunts.items():
+            brows.append(("电容/电抗", sh.name,
+                          net.shunt_p_mw.get(uid),
+                          net.shunt_q_mvar.get(uid), None))
         brows.sort(key=lambda r: r[1])
         self.branch_table.clear()
         self.branch_table.setColumnCount(5)
@@ -160,7 +175,8 @@ class ResultsPanel(QWidget):
                     if bg is not None:
                         item.setBackground(bg)
                 self.branch_table.setItem(i, j, item)
-            container = {"线路": net.lines, "变压器": net.trafos, "阻抗": net.impedances}[kind]
+            container = {"线路": net.lines, "变压器": net.trafos,
+                         "阻抗": net.impedances, "电容/电抗": net.shunts}[kind]
             uid = next((u for u, b in container.items() if b.name == name), None)
             self._branch_row_uids.append(uid or "")
 

@@ -78,6 +78,9 @@ class TrafoButton(ComponentButton):
 class ImpedanceButton(ComponentButton):
     KIND = "Impedance"; LABEL = "阻抗  Impedance"; COLOR = "#78783c"
 
+class ShuntButton(ComponentButton):
+    KIND = "Shunt"; LABEL = "电容/电抗  Shunt"; COLOR = "#208080"
+
 
 class ComponentPalette(QWidget):
     """Container panel holding the five component buttons."""
@@ -97,7 +100,8 @@ class ComponentPalette(QWidget):
         hint.setWordWrap(True)
         layout.addWidget(hint)
 
-        for cls in (BusButton, GenButton, LoadButton, TrafoButton, ImpedanceButton):
+        for cls in (BusButton, GenButton, LoadButton, TrafoButton,
+                    ImpedanceButton, ShuntButton):
             layout.addWidget(cls())
 
         layout.addStretch(1)

@@ -885,3 +885,105 @@ class TestNegativeLoadUI:
         assert sb.value() == pytest.approx(-5.0)
         sb.setValue(-30.0)
         assert m.p_mw == pytest.approx(-30.0), "负值应能写回 model"
+
+
+class TestRoundAFeatures:
+    def test_shunt_add_via_palette_builder(self, scene):
+        """并联电容/电抗器: 元件库拖放路径(表驱动 builder)"""
+        scene.add_component("Bus", 200, 300)
+        sh = scene.add_component("Shunt", 260, 150)
+        assert sh.model.bus_uid
+        from canvas import kind_of
+        assert kind_of(sh) == "Shunt"
+
+    def test_shunt_properties_form_and_results(self, scene, qapp):
+        from properties import PropertiesPanel
+        from solver import run_power_flow, ShuntUnit
+        t_bus = scene.add_component("Bus", 200, 300)
+        scene.add_component("Gen", 150, 150)
+        sh = scene.add_component("Shunt", 260, 150)
+        ok, msg = run_power_flow(scene.network)
+        assert ok, msg
+        panel = PropertiesPanel()
+        panel.attach_scene(scene)
+        panel.show_component(sh)
+        sb = panel._fields["q_mvar"]
+        sb.setValue(-20.0)
+        assert sh.model.q_mvar == -20.0
+        ok, msg = run_power_flow(scene.network)
+        assert ok, msg
+        panel.show_component(sh)
+        texts = []
+        for i in range(panel.result_layout.count()):
+            wdg = panel.result_layout.itemAt(i).widget()
+            if wdg is not None:
+                texts.append(wdg.text())
+        assert any("注入无功" in t or "—" in t for t in texts)
+
+    def test_tap_pos_spinbox(self, qapp):
+        from properties import PropertiesPanel
+        from canvas import CircuitScene
+        from solver import Network
+        scene = CircuitScene(Network())
+        t = scene.add_component("Trafo", 300, 300)
+        panel = PropertiesPanel()
+        panel.attach_scene(scene)
+        panel.show_component(t)
+        sb = panel._fields["tap_pos"]
+        sb.setValue(2)
+        assert t.model.tap_pos == 2
+
+    def test_gen_opf_fields_in_form(self, qapp):
+        from properties import PropertiesPanel
+        from canvas import CircuitScene
+        from solver import Network
+        scene = CircuitScene(Network())
+        g = scene.add_component("Gen", 150, 150)
+        panel = PropertiesPanel()
+        panel.attach_scene(scene)
+        panel.show_component(g)
+        for f in ("min_p_mw", "max_p_mw", "cost_per_mw",
+                  "s_sc_max_mva", "s_sc_min_mva", "kappa"):
+            assert f in panel._fields, f"Gen 表单缺 {f}"
+
+    def test_opf_menu_action(self, qapp):
+        from app import MainWindow
+        w = MainWindow()
+        w._load_two_end_demo()
+        ok, err = w._run_opf()
+        assert ok, err
+        assert w.network.converged
+
+    def test_short_circuit_menu_action(self, qapp):
+        from app import MainWindow
+        w = MainWindow()
+        w._load_two_end_demo()
+        ok, err = w._run_short_circuit("max")
+        assert ok, err
+        assert len(w.network.bus_ikss_ka) == 5
+
+    def test_loss_label_after_run(self, qapp):
+        from app import MainWindow
+        w = MainWindow()
+        w._load_demo()
+        ok, err = w._run_power_flow()
+        assert ok, err
+        assert "总网损" in w.results_panel.loss_label.text()
+        assert "MW" in w.results_panel.loss_label.text()
+
+    def test_shunt_in_branch_table_and_parse(self, qapp, tmp_path):
+        from app import MainWindow, network_to_json_dict, parse_topology_json
+        w = MainWindow()
+        w.scene.add_component("Bus", 200, 300)
+        w.scene.add_component("Gen", 150, 150)
+        w.scene.add_component("Shunt", 260, 150)
+        data = network_to_json_dict(w.network)
+        assert "shunts" in data and len(data["shunts"]) == 1
+        net = parse_topology_json(data)
+        assert len(net.shunts) == 1
+        ok, msg = w._run_power_flow()
+        assert ok, msg
+        panel = w.results_panel
+        kinds = [panel.branch_table.item(r, 0).text()
+                 for r in range(panel.branch_table.rowCount())]
+        assert "电容/电抗" in kinds
