@@ -205,6 +205,34 @@ class PropertiesPanel(QWidget):
                 self._add_result("电压 (pu)", f"{v:.4f}" if v is not None else "—")
                 self._add_result("电压 (kV)", f"{vk:.2f}" if vk is not None else "—")
                 self._add_result("相角 (°)", f"{a:.3f}" if a is not None else "—")
+            elif isinstance(item, GenItem):
+                # PV node: P is input, V is input, Q is the result.
+                # Slack node: V and θ are input, P and Q are results.
+                p = net.gen_p_mw.get(m.uid)
+                q = net.gen_q_mvar.get(m.uid)
+                # vm_pu is filled for PV nodes (res_gen has it) but not
+                # slack (res_ext_grid doesn't). Fall back to model input.
+                vm = net.gen_vm_pu.get(m.uid, m.vm_pu)
+                self._add_result("实际有功 P (MW)", f"{p:+.2f}" if p is not None else "—")
+                self._add_result("实际无功 Q (Mvar)", f"{q:+.2f}" if q is not None else "—")
+                self._add_result("机端电压 (pu)", f"{vm:.4f}" if vm is not None else "—")
+                if vm is not None:
+                    if vm < 0.95:
+                        self._add_result("状态", "⚠ 电压偏低")
+                    elif vm > 1.05:
+                        self._add_result("状态", "⚠ 电压偏高")
+                    else:
+                        self._add_result("状态", "✓ 正常")
+            elif isinstance(item, LoadItem):
+                # PQ node: P and Q are inputs; voltage and angle are results.
+                v = net.bus_voltage_pu.get(m.bus_uid)
+                a = net.bus_va_degree.get(m.bus_uid)
+                p_actual = net.load_p_mw.get(m.uid, m.p_mw)
+                q_actual = net.load_q_mvar.get(m.uid, m.q_mvar)
+                self._add_result("负荷有功 P (MW)", f"{p_actual:.2f}")
+                self._add_result("负荷无功 Q (Mvar)", f"{q_actual:.2f}")
+                self._add_result("母线电压 (pu)", f"{v:.4f}" if v is not None else "—")
+                self._add_result("母线相角 (°)", f"{a:.3f}" if a is not None else "—")
             elif isinstance(item, TrafoItem):
                 self._add_result("变压器结果", "暂未提取 (仅作连线占位)")
             elif isinstance(item, ImpedanceItem):

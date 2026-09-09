@@ -114,6 +114,12 @@ class Network:
     trafo_q_hv_mvar: Dict[str, float] = field(default_factory=dict)
     trafo_p_lv_mw: Dict[str, float] = field(default_factory=dict)
     trafo_q_lv_mvar: Dict[str, float] = field(default_factory=dict)
+    # Per-generator / per-load results (PV node's actual Q output, etc.)
+    gen_p_mw: Dict[str, float] = field(default_factory=dict)
+    gen_q_mvar: Dict[str, float] = field(default_factory=dict)
+    gen_vm_pu: Dict[str, float] = field(default_factory=dict)
+    load_p_mw: Dict[str, float] = field(default_factory=dict)
+    load_q_mvar: Dict[str, float] = field(default_factory=dict)
     converged: bool = False
     error_msg: str = ""
 
@@ -122,8 +128,16 @@ class Network:
 # 2. 拓扑 -> pandapower
 # ============================================================
 
-def build_pandapower(net: Network) -> pp.pandapowerNet:
-    """把画布拓扑转成 pandapower 网络对象"""
+def build_pandapower(net: Network) -> Tuple[pp.pandapowerNet, Dict[int, str], Dict[int, str], Dict[int, str]]:
+    """
+    把画布拓扑转成 pandapower 网络对象
+
+    返回 (pnet, pp_ext_to_uid, pp_gen_to_uid, pp_load_to_uid) — 后三个映射供
+    run_power_flow 把 pandapower 的 res_ext_grid / res_gen / res_load 反向
+    索引回我们自己的元件 uid。ext_grid 和 gen 在 pandapower 是分开的两张表,
+    各自从 0 计数, 所以必须分两个映射。如果以后想加结果字段别忘了也通过
+    这几个映射取数据。
+    """
     pnet = pp.create_empty_network(name="gui_circuit")
 
     # 必须有至少一个外部电网(平衡节点) + 一个母线, 否则 PP 抛错
@@ -135,11 +149,17 @@ def build_pandapower(net: Network) -> pp.pandapowerNet:
         bus_id_map[uid] = pp_bus
 
     # 平衡节点: 第一个 Gen 当 ext_grid(slack), 其余 Gen 当 gen(PV 节点)
+    # Map pp gen / ext_grid / load id back to our uid for result extraction.
+    # ext_grid and gen have separate id spaces in pandapower, so we keep
+    # two separate maps and merge at read time.
+    pp_ext_to_uid: Dict[int, str] = {}
+    pp_gen_to_uid: Dict[int, str] = {}
+    pp_load_to_uid: Dict[int, str] = {}
     gen_uids = list(net.gens.keys())
     if gen_uids:
         first_gen_uid = gen_uids[0]
         first_gen = net.gens[first_gen_uid]
-        pp.create_ext_grid(
+        pp_id = pp.create_ext_grid(
             pnet,
             bus=bus_id_map[first_gen.bus_uid],
             vm_pu=first_gen.vm_pu,
@@ -147,10 +167,11 @@ def build_pandapower(net: Network) -> pp.pandapowerNet:
             max_p_mw=first_gen.p_mw * 2,
             min_p_mw=0.0,
         )
+        pp_ext_to_uid[pp_id] = first_gen_uid
         has_slack = True
         for uid in gen_uids[1:]:
             g = net.gens[uid]
-            pp.create_gen(
+            pp_id = pp.create_gen(
                 pnet,
                 bus=bus_id_map[g.bus_uid],
                 p_mw=g.p_mw,
@@ -158,6 +179,7 @@ def build_pandapower(net: Network) -> pp.pandapowerNet:
                 name=g.name,
                 controllable=False,
             )
+            pp_gen_to_uid[pp_id] = uid
 
     # 如果没有发电机, 用第一条母线当 ext_grid, 避免 PP 报错
     if not has_slack and net.buses:
@@ -171,13 +193,14 @@ def build_pandapower(net: Network) -> pp.pandapowerNet:
 
     # 负荷
     for uid, ld in net.loads.items():
-        pp.create_load(
+        pp_id = pp.create_load(
             pnet,
             bus=bus_id_map[ld.bus_uid],
             p_mw=ld.p_mw,
             q_mvar=ld.q_mvar,
             name=ld.name,
         )
+        pp_load_to_uid[pp_id] = uid
 
     # 自定义一个 GUI 用的线路/变压器型号
     pp.create_std_type(
@@ -246,7 +269,7 @@ def build_pandapower(net: Network) -> pp.pandapowerNet:
             name=imp.name,
         )
 
-    return pnet
+    return pnet, pp_ext_to_uid, pp_gen_to_uid, pp_load_to_uid
 
 
 # ============================================================
@@ -271,6 +294,11 @@ def run_power_flow(net: Network) -> Tuple[bool, str]:
     net.trafo_q_hv_mvar.clear()
     net.trafo_p_lv_mw.clear()
     net.trafo_q_lv_mvar.clear()
+    net.gen_p_mw.clear()
+    net.gen_q_mvar.clear()
+    net.gen_vm_pu.clear()
+    net.load_p_mw.clear()
+    net.load_q_mvar.clear()
     net.converged = False
     net.error_msg = ""
 
@@ -280,7 +308,7 @@ def run_power_flow(net: Network) -> Tuple[bool, str]:
         return False, "至少需要一个电源(发电机)作为平衡节点"
 
     try:
-        pnet = build_pandapower(net)
+        pnet, pp_ext_to_uid, pp_gen_to_uid, pp_load_to_uid = build_pandapower(net)
         pp.runpp(pnet, algorithm="nr", init="flat", numba=False)
     except pp.LoadflowNotConverged as e:
         return False, f"潮流不收敛: {e}"
@@ -337,6 +365,29 @@ def run_power_flow(net: Network) -> Tuple[bool, str]:
                 net.trafo_q_hv_mvar[uid] = float(tr["q_hv_mvar"])
                 net.trafo_p_lv_mw[uid] = float(tr["p_lv_mw"])
                 net.trafo_q_lv_mvar[uid] = float(tr["q_lv_mvar"])
+
+        # PV gens — actual Q output (the result, not an input)
+        for pp_id, g in pnet.res_gen.iterrows():
+            uid = pp_gen_to_uid.get(pp_id)
+            if uid is not None:
+                net.gen_p_mw[uid] = float(g["p_mw"])
+                net.gen_q_mvar[uid] = float(g["q_mvar"])
+                net.gen_vm_pu[uid] = float(g["vm_pu"])
+        # Slack ext_grid — same fields, separate id space. The slack
+        # bus's V is an input, not a result, so we don't write vm_pu
+        # here (it stays at whatever the user set).
+        for pp_id, eg in pnet.res_ext_grid.iterrows():
+            uid = pp_ext_to_uid.get(pp_id)
+            if uid is not None:
+                net.gen_p_mw[uid] = float(eg["p_mw"])
+                net.gen_q_mvar[uid] = float(eg["q_mvar"])
+        # Loads — confirmed P/Q (pandapower passes through, but useful for
+        # comparing against net.loads and detecting scaling issues)
+        for pp_id, ld in pnet.res_load.iterrows():
+            uid = pp_load_to_uid.get(pp_id)
+            if uid is not None:
+                net.load_p_mw[uid] = float(ld["p_mw"])
+                net.load_q_mvar[uid] = float(ld["q_mvar"])
     except Exception as e:
         return False, f"读取结果错误: {type(e).__name__}: {e}"
 
