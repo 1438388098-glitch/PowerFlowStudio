@@ -60,7 +60,8 @@ class PropertiesPanel(QWidget):
         elif kind == "Load":
             self._add_name_field()
             self._add_combo_bus(model, "bus_uid", "挂接母线", model.bus_uid)
-            self._add_float(model, "p_mw", "有功 P (MW)", model.p_mw, 0, 5000, 1)
+            # 负负荷 = 该点注入功率(等效电源), 允许为负
+            self._add_float(model, "p_mw", "有功 P (MW)", model.p_mw, -5000, 5000, 1)
             self._add_float(model, "q_mvar", "无功 Q (Mvar)", model.q_mvar, -1000, 1000, 2)
         elif kind == "Trafo":
             self._add_name_field()

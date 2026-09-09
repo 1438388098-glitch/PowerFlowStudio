@@ -355,3 +355,18 @@ class TestNMinus1:
         report = n_minus_1_check(net)
         assert "_base_failed" in report
         assert "失败" in format_n1_report(report)
+
+
+class TestNegativeLoad:
+    def test_negative_load_is_generation(self):
+        """负负荷 = 该点注入功率, 潮流应收敛且结果回写负值"""
+        net = build_3bus_network()
+        net.loads["l1"].p_mw = -5.0   # B2 上等效注入 5 MW
+        ok, msg = run_power_flow(net)
+        assert ok, msg
+        assert net.load_p_mw["l1"] == pytest.approx(-5.0)
+        # 平衡节点少带 5MW: 发电总量 = 总负荷(净) + 网损
+        gen_p = sum(net.gen_p_mw.values())
+        net_load_p = sum(net.load_p_mw.values())
+        assert gen_p == pytest.approx(net_load_p, abs=5.0)
+        assert gen_p > net_load_p   # 网损仍为正

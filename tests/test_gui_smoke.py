@@ -866,3 +866,22 @@ class TestRound10Features:
         w = MainWindow()
         # 无自动保存文件时提示为 None
         assert w._startup_autosave_hint is None or isinstance(w._startup_autosave_hint, str)
+
+
+class TestNegativeLoadUI:
+    def test_load_p_mw_spinbox_allows_negative(self, qapp):
+        """回归: 负荷有功 P 曾被限制在 0-5000, 无法输入负值"""
+        from properties import PropertiesPanel
+        from canvas import CircuitScene, LoadItem
+        from solver import Network, LoadUnit
+        scene = CircuitScene(Network())
+        m = LoadUnit(uid="l1", name="L1", bus_uid="", p_mw=-5.0)
+        item = LoadItem(m)
+        panel = PropertiesPanel()
+        panel.attach_scene(scene)
+        panel.show_component(item)
+        sb = panel._fields["p_mw"]
+        assert sb.minimum() == -5000.0, "负荷 P 下限应允许负值"
+        assert sb.value() == pytest.approx(-5.0)
+        sb.setValue(-30.0)
+        assert m.p_mw == pytest.approx(-30.0), "负值应能写回 model"
