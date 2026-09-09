@@ -1,74 +1,76 @@
 @echo off
 REM ============================================================
-REM PowerFlowStudio Windows 一键打包脚本
-REM 在项目根目录双击运行即可, 产出 dist\PowerFlowStudio.exe
+REM PowerFlowStudio Windows build script
+REM Double-click this file in the project root. Outputs:
+REM   dist\PowerFlowStudio.exe
 REM ============================================================
 
-setlocal
+REM Switch console to UTF-8 so any non-ASCII chars render correctly
+chcp 65001 > nul
 
-echo === PowerFlowStudio Windows 打包脚本 ===
+echo === PowerFlowStudio Windows build script ===
 echo.
 
-REM 检查 Python
+REM --- Check Python ---
 where python >nul 2>&1
 if errorlevel 1 (
-    echo [错误] 未找到 python, 请先安装 Python 3.10+ 并加入 PATH
-    echo 下载: https://www.python.org/downloads/
+    echo [ERROR] python not found in PATH.
+    echo Install Python 3.10+ and ensure it is on PATH:
+    echo   https://www.python.org/downloads/
     pause
     exit /b 1
 )
 
-echo [1/4] Python 版本:
+echo [1/4] Python version:
 python --version
 echo.
 
-REM 探测 venv 是否已存在
+REM --- Probe whether venv already exists ---
 set HAS_VENV=0
 if exist ".venv\Scripts\python.exe" set HAS_VENV=1
 
 if "%HAS_VENV%"=="0" (
-    echo [2/4] 创建虚拟环境 .venv ...
+    echo [2/4] Creating virtual environment .venv ...
     python -m venv .venv
     if errorlevel 1 (
-        echo [错误] 虚拟环境创建失败
+        echo [ERROR] Failed to create virtual environment.
         pause
         exit /b 1
     )
 ) else (
-    echo [2/4] 虚拟环境已存在, 跳过创建
+    echo [2/4] Virtual environment already exists, skipping creation.
 )
 echo.
 
-REM 激活虚拟环境 + 装依赖
-echo [3/4] 安装依赖 ^(PyQt5 pyqtgraph pandapower numpy pyinstaller^) ...
+REM --- Activate venv and install deps ---
+echo [3/4] Installing dependencies: PyQt5 pyqtgraph pandapower numpy pyinstaller ...
 call .venv\Scripts\activate.bat
 if errorlevel 1 (
-    echo [错误] 虚拟环境激活失败
+    echo [ERROR] Failed to activate virtual environment.
     pause
     exit /b 1
 )
 python -m pip install --upgrade pip --quiet
 python -m pip install PyQt5 pyqtgraph pandapower numpy pyinstaller --quiet
 if errorlevel 1 (
-    echo [错误] 依赖安装失败
+    echo [ERROR] Failed to install dependencies.
     pause
     exit /b 1
 )
 echo.
 
-REM 打包
-echo [4/4] 运行 pyinstaller ^(这一步会比较慢, 通常 1-3 分钟^) ...
+REM --- Run pyinstaller ---
+echo [4/4] Running pyinstaller (this takes 1-3 minutes on first run) ...
 pyinstaller --onefile --windowed --name PowerFlowStudio --noconfirm app.py
 if errorlevel 1 (
-    echo [错误] 打包失败
+    echo [ERROR] pyinstaller failed.
     pause
     exit /b 1
 )
 
 echo.
-echo === 打包完成 ===
-echo 产物: dist\PowerFlowStudio.exe
-echo.
-echo 双击运行, 或拖到桌面创建快捷方式.
+echo === Build complete ===
+echo Output: dist\PowerFlowStudio.exe
+echo Double-click it to run, or drag to desktop to make a shortcut.
 pause
 endlocal
