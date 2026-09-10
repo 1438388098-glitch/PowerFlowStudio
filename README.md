@@ -68,6 +68,10 @@ POWERFLOW_UI_SCALE=1.5 python tools/render_multires.py # 模拟 150% 缩放
 
 ## 安装
 
+**Windows 最简方式**: 双击项目根目录的 **`start.bat`** —— 首次运行自动创建虚拟环境并安装依赖(清华镜像), 之后每次双击直接启动 GUI, 全程无需命令行。
+
+手动安装(推荐 uv, 依赖版本见 requirements.txt, 已在 Python 3.13 验证):
+
 ```bash
 # 推荐: 使用 uv (依赖版本见 requirements.txt, 已在 Python 3.13 验证)
 uv venv .venv
