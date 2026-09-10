@@ -1039,7 +1039,11 @@ class TestRoundBFeatures:
         w = MainWindow()
         w._load_demo()
         dlg = SearchDialog(w.scene)
-        assert dlg.listw.count() == 6   # 3 bus + 1 gen + 2 load
+        # 3 bus + 1 gen + 2 load + 2 line(支路连线也要能搜到 —— 回归:
+        # 以前只遍历 _comp_by_uid, 线路没有独立图形项, 搜 "Line" 永远是空)
+        assert dlg.listw.count() == 8
+        assert any(lbl.startswith("[Line]") for lbl in (
+            dlg.listw.item(i).text() for i in range(dlg.listw.count())))
         dlg.edit.setText("G1")
         visible = [i for i in range(dlg.listw.count())
                    if not dlg.listw.item(i).isHidden()]
@@ -1049,6 +1053,11 @@ class TestRoundBFeatures:
         dlg.item_selected.connect(lambda u: got.update(u=u))
         dlg._activate(dlg.listw.item(visible[0]))
         assert got.get("u") == uid
+        # 按类型关键字能筛出线路
+        dlg.edit.setText("Line")
+        visible = [i for i in range(dlg.listw.count())
+                   if not dlg.listw.item(i).isHidden()]
+        assert len(visible) == 2
 
     def test_minimap_dock_refresh(self, qapp):
         from app import MainWindow
@@ -1221,3 +1230,130 @@ class TestReviewRegressionsGUI:
         assert len(pasted) == 2
         xs = sorted(m.x for m in pasted)
         assert xs[-1] - xs[0] == pytest.approx(0.0),             "剪贴板被污染时二次粘贴坐标会叠加偏移"
+
+
+class TestThemeAndLayout:
+    """外观 / 高分屏 / 分辨率适配的回归测试"""
+
+    def _lum(self, hex_color: str) -> float:
+        from PyQt5.QtGui import QColor
+        c = QColor(hex_color)
+        return (0.299 * c.red() + 0.587 * c.green()
+                + 0.114 * c.blue()) / 255.0
+
+    def test_tint_returns_solid_light_color(self, qapp):
+        """回归: 拼 '#RRGGBBAA' 会被 Qt 读成 '#AARRGGBB'。
+
+        ``#dc64201a`` 于是变成"86% 不透明的深褐色"而不是 10% 橙色 ——
+        元件库按钮整片变脏。tint() 在 Python 侧算混合色, 只能输出 6 位。
+        """
+        from palette import tint
+        for spec in ("#3c78c8", "#dc6420", "#50a050", "#963c96",
+                     "#78783c", "#208080"):
+            for amount in (0.12, 0.22, 0.32):
+                out = tint(spec, amount)
+                assert len(out) == 7 and out.startswith("#"), out
+                assert self._lum(out) > 0.70, (
+                    f"{spec} 按 {amount} 混出的 {out} 偏暗, "
+                    "8 位十六进制的老问题又回来了")
+
+    def test_palette_button_background_is_light(self, qapp):
+        """端到端: 按钮**实际生效**的样式表背景必须仍是浅色。"""
+        import re
+        from palette import BusButton, GenButton, ImpedanceButton, ShuntButton
+        for cls in (BusButton, GenButton, ImpedanceButton, ShuntButton):
+            btn = cls()
+            m = re.search(r"background:\s*(#[0-9a-fA-F]{6})\s*;",
+                          btn.styleSheet())
+            assert m, f"{cls.__name__} 样式表里没有合法的 6 位背景色"
+            assert self._lum(m.group(1)) > 0.70, (
+                f"{cls.__name__} 背景 {m.group(1)} 偏暗")
+
+    def test_build_font_sets_real_family(self, qapp):
+        """回归: 只调 setFamilies 不调 setFamily → family() 空, 回退 SimSun。"""
+        import theme
+        fams = theme.resolved_families()
+        assert fams, "字体候选列表不应为空"
+        f = theme.build_font()
+        assert f.family(), "family() 为空说明会回退到系统默认字体"
+        assert f.family() == fams[0], (f.family(), fams[0])
+        assert f.pointSizeF() > 0
+
+    def test_sanitize_splitter_sizes_rejects_stale_settings(self):
+        """回归: 旧版本写死的布局留在 QSettings 里, 恢复后画布只剩 124px。"""
+        import theme
+        stale = ["240", "124", "268"]
+        got = theme.sanitize_splitter_sizes(stale, 1920)
+        assert got == theme.splitter_sizes(1920)
+        assert got[1] > 900, "画布栏没被撑开, 等于恢复了那个哑状态"
+
+    def test_sanitize_splitter_sizes_keeps_good_settings(self):
+        import theme
+        good = theme.splitter_sizes(1920)
+        assert theme.sanitize_splitter_sizes(good, 1920) == good
+
+    def test_sanitize_splitter_sizes_handles_garbage(self):
+        import theme
+        expect = theme.splitter_sizes(1920)
+        for bad in (None, [], ["a", "b", "c"], [1, 2], [0, 0, 0],
+                    [1, 1, 1], "oops"):
+            assert theme.sanitize_splitter_sizes(bad, 1920) == expect, bad
+
+    def test_minimum_window_fits_inside_screen(self):
+        """最小尺寸不能大过可用区域, 否则 1366×768 上一开就超出屏幕。"""
+        import theme
+        mn = theme.minimum_window_size()
+        avail = theme.available_geometry()
+        assert mn.width() <= avail.width()
+        assert mn.height() <= avail.height()
+        assert mn.width() >= 800 and mn.height() >= 560
+
+    def test_properties_min_width_fits_widest_form(self, scene, qapp):
+        """回归: 面板最小值放不下表单 → 标签末字被裁 + 弹横向滚动条。"""
+        from properties import PropertiesPanel
+        gen = scene.add_component("Gen", 200, 200)   # 字段最多的一类
+        panel = PropertiesPanel()
+        panel.attach_scene(scene)
+        panel.show_component(gen)
+        panel.resize(panel.minimumWidth(), 900)
+        panel.show()
+        qapp.processEvents()
+        assert panel._form_scroll.horizontalScrollBar().maximum() == 0, (
+            "面板最小宽度装不下发电机表单, 会裁掉标签并出现横向滚动条")
+
+    def test_refresh_results_leaves_no_stale_widgets(self, scene, qapp):
+        """回归: 只调 deleteLater 时旧标签仍挂在父级上, 与新行重叠绘制。
+
+        ``takeAt`` 只把控件移出布局, 不解父子关系; 延迟删除要等事件循环
+        空闲才执行。期间旧控件带着旧坐标继续绘制 —— 属性面板就出现两层
+        文字叠在一起的乱码。_drop_layout 先 setParent(None) 立即脱离。
+        """
+        from PyQt5.QtWidgets import QLabel
+        from properties import PropertiesPanel
+        a = scene.add_component("Bus", 100, 100)
+        b = scene.add_component("Bus", 400, 100)
+        panel = PropertiesPanel()
+        panel.attach_scene(scene)
+        panel.show_component(a)
+        assert panel.result_layout.rowCount() > 0
+        # 不调 processEvents: 正是要验证"延迟删除还没执行"时也不残留
+        panel.show_component(b)
+        rows = panel.result_layout.rowCount()
+        alive = panel.result_box.findChildren(QLabel)
+        # 每行两枚 QLabel(标签 + 数值); 翻倍说明旧控件还挂在父级上
+        assert len(alive) <= 2 * rows, (
+            f"结果区残留 {len(alive)} 个标签, 当前只有 {rows} 行")
+
+    def test_clear_form_leaves_no_stale_widgets(self, scene, qapp):
+        from PyQt5.QtWidgets import QWidget
+        from properties import PropertiesPanel
+        gen = scene.add_component("Gen", 200, 200)
+        panel = PropertiesPanel()
+        panel.attach_scene(scene)
+        panel.show_component(gen)
+        n_fields = len(panel._fields)
+        assert n_fields > 5
+        panel.clear()
+        leftovers = [w for w in panel.form_host.findChildren(QWidget)
+                     if w is not panel.form_host]
+        assert leftovers == [], f"清空表单后仍有 {len(leftovers)} 个控件残留"

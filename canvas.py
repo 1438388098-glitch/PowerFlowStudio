@@ -9,7 +9,7 @@ from typing import Dict, Optional, List
 
 from PyQt5.QtCore import Qt, QPointF, QRectF, QLineF, pyqtSignal
 from PyQt5.QtGui import (
-    QBrush, QPen, QColor, QPainter, QPainterPath, QFont, QPolygonF
+    QBrush, QPen, QColor, QPainter, QPainterPath, QFont, QPolygonF, QPixmap
 )
 from PyQt5.QtWidgets import (
     QGraphicsScene, QGraphicsView, QGraphicsItem,
@@ -38,19 +38,62 @@ COLOR_LINE = QColor(80, 80, 80)
 COLOR_TRAFO = QColor(150, 60, 150)
 COLOR_IMP = QColor(120, 120, 60)
 
-# 结果可视化: 电压标幺阈值
-V_NORMAL = 0.95
-V_WARN_LOW = 0.90
-V_WARN_HIGH = 1.05
-V_HIGH = 1.10
+# 结果可视化阈值: 统一由 defaults 提供, 避免画布/属性面板/结果表各写一套
+V_NORMAL = D.V_NORMAL_PU
+V_WARN_LOW = D.V_WARN_LOW_PU
+V_WARN_HIGH = D.V_WARN_HIGH_PU
+V_HIGH = D.V_HIGH_PU
 
 # 负载率阈值 (%)
-LOADING_WARN = 80.0
-LOADING_CRIT = 100.0
+LOADING_WARN = D.LOADING_WARN_PERCENT
+LOADING_CRIT = D.LOADING_CRIT_PERCENT
 
 COLOR_LOADING_OK = QColor(80, 150, 80)       # < 80%: 绿
 COLOR_LOADING_WARN = QColor(220, 170, 40)    # 80-100%: 黄
 COLOR_LOADING_CRIT = QColor(210, 60, 60)     # >= 100%: 红
+
+COLOR_BUS_ISOLATED = QColor(205, 205, 205)   # 孤立母线(NaN 电压): 灰
+COLOR_BUS_DC = QColor(215, 220, 235)         # DC 模式下电压幅值无意义: 中性蓝灰
+COLOR_V_OVER_LIMIT = QColor(255, 150, 150)   # 严重越限
+COLOR_V_OVER = QColor(255, 230, 150)         # 越限
+COLOR_V_NORMAL = QColor(200, 240, 200)       # 正常
+
+# ---- 复用的绘图对象 ----
+# paint() 以前每帧都 new 一批 QPen/QBrush/QFont, 118 母线规模下是高频
+# 分配 + GC 压力。这里全提成常量(除 QFont 见 _font 缓存)。
+_PEN_BUS = QPen(COLOR_BUS, 2)
+_PEN_GEN = QPen(COLOR_GEN, 2)
+_PEN_LOAD = QPen(COLOR_LOAD, 2)
+_PEN_SHUNT = QPen(QColor(32, 128, 128), 2)
+_PEN_BLACK_2 = QPen(Qt.black, 2)
+_PEN_BLACK_1 = QPen(Qt.black, 1)
+_PEN_DARKGRAY = QPen(Qt.darkGray, 1.5)
+_PEN_GRID = QPen(QColor(225, 225, 225), 1)
+_PEN_LINECOMP = QPen(COLOR_LINE, 3)
+_PEN_TRAFO = QPen(COLOR_TRAFO, 3)
+_PEN_IMP = QPen(COLOR_IMP, 3)
+_PEN_TRAFO_MID = QPen(COLOR_TRAFO, 2)
+_PEN_IMP_MID = QPen(COLOR_IMP, 2)
+_PEN_LINECOMP_MID = QPen(COLOR_LINE, 2)
+_BRUSH_GEN_FILL = QBrush(COLOR_GEN_FILL)
+_BRUSH_LOAD_FILL = QBrush(COLOR_LOAD_FILL)
+_BRUSH_WHITE = QBrush(Qt.white)
+
+_FONT_CACHE: Dict[tuple, QFont] = {}
+
+
+def _font(size: int, bold: bool = False) -> QFont:
+    """按 (字号, 加粗) 缓存 QFont。
+
+    QFont 依赖字体数据库, 因此不在导入期构造, 首次绘图时再建并复用。
+    """
+    key = (size, bold)
+    f = _FONT_CACHE.get(key)
+    if f is None:
+        f = QFont("Arial", size, QFont.Bold if bold else QFont.Normal)
+        _FONT_CACHE[key] = f
+    return f
+
 
 
 def loading_color(loading_percent: Optional[float]) -> Optional[QColor]:
@@ -66,16 +109,24 @@ def loading_color(loading_percent: Optional[float]) -> Optional[QColor]:
 COLOR_BUS_ISOLATED = QColor(205, 205, 205)   # 孤立母线(NaN 电压): 灰
 
 
-def voltage_color(v_pu: Optional[float]) -> QColor:
+def voltage_color(v_pu: Optional[float], dc_mode: bool = False) -> QColor:
+    """按电压标幺给母线着色。
+
+    dc_mode=True 时电压幅值恒为 1.0(pandapower 直流潮流不求解幅值),
+    此时按"正常/越限"着色会给用户错误暗示, 统一给中性色。
+    """
+    if dc_mode:
+        return COLOR_BUS_DC
     if v_pu is None:
         return COLOR_BUS_FILL
     if v_pu != v_pu:                     # NaN: 未连入电网
         return COLOR_BUS_ISOLATED
     if v_pu < V_WARN_LOW or v_pu > V_HIGH:
-        return QColor(255, 150, 150)   # 严重越限: 红
+        return COLOR_V_OVER_LIMIT        # 严重越限: 红
     if v_pu < V_NORMAL or v_pu > V_WARN_HIGH:
-        return QColor(255, 230, 150)   # 越限: 黄
-    return QColor(200, 240, 200)       # 正常: 绿
+        return COLOR_V_OVER              # 越限: 黄
+    return COLOR_V_NORMAL                # 正常: 绿
+
 
 
 # ============================================================
@@ -83,12 +134,21 @@ def voltage_color(v_pu: Optional[float]) -> QColor:
 # ============================================================
 
 class PortItem(QGraphicsEllipseItem):
-    """A connection port on a component (small circle). 8x8."""
+    """A connection port on a component (small circle). 8x8.
+
+    端口自身的鼠标事件**不在这里处理**: CircuitView.mousePressEvent 命中
+    端口后会直接接管并 return, 事件的传送链根本走不到这里。以前这里留了
+    一个调用 scene.views()[0] 的处理函数 —— 既是死代码, 又埋了一个雷:
+    views()[0] 依赖创建顺序(小地图也共享同一个 scene), 谁先建谁就被当成
+    "主视图", 顺序一变连线就派发到错误视图; 而且哪天有人补上 super()
+    还会双击发(两条橡皮线)。统一由视图层处理, 这里只描述外观。
+    """
+
     def __init__(self, parent_item: "BaseComponent", port_id: str):
         super().__init__(-4, -4, 8, 8, parent_item)
         self.port_id = port_id
         self.setBrush(QBrush(QColor(40, 40, 40)))
-        self.setPen(QPen(Qt.black, 1))
+        self.setPen(_PEN_BLACK_1)
         self.setFlag(QGraphicsItem.ItemIsSelectable, False)
         self.setCursor(Qt.CrossCursor)
         # Ports must receive mouse events even when the view is in
@@ -99,21 +159,6 @@ class PortItem(QGraphicsEllipseItem):
         # a connection line.
         self.setFlag(QGraphicsItem.ItemHasNoContents, False)
         self.setAcceptedMouseButtons(Qt.LeftButton)
-
-    def mousePressEvent(self, event):
-        # Hand control back to the view so it can begin drawing a
-        # connection. The view looks up its own _pending_port from
-        # scene().itemAt() (or directly from this item via the event
-        # position), but we set a flag on the scene so the view can
-        # find us without ambiguity.
-        if event.button() == Qt.LeftButton:
-            scene = self.scene()
-            view = scene.views()[0] if scene.views() else None
-            if view is not None and hasattr(view, "_start_connection_from_port"):
-                view._start_connection_from_port(self, event)
-                event.accept()
-                return
-        super().mousePressEvent(event)
 
 
 class BaseComponent(QGraphicsItem):
@@ -139,10 +184,7 @@ class BaseComponent(QGraphicsItem):
         if self.HAS_PORTS:
             self._init_ports()
         self._label = QGraphicsTextItem(self.model.name, self)
-        f = QFont()
-        f.setPointSize(9)
-        f.setBold(True)
-        self._label.setFont(f)
+        self._label.setFont(_font(9, bold=True))
         self._label.setDefaultTextColor(Qt.black)
         # 文字位置: 元件下方
         br = self._label.boundingRect()
@@ -176,16 +218,27 @@ class BaseComponent(QGraphicsItem):
         # (不回写的话保存/载入会丢掉用户摆好的布局)
         # 注意: 变压器/阻抗的 model 没有 x/y 字段, 回写前先探测
         if change == QGraphicsItem.ItemPositionHasChanged:
-            if hasattr(self.model, "x"):
-                self.model.x = float(self.pos().x())
-            if hasattr(self.model, "y"):
-                self.model.y = float(self.pos().y())
-            for c in self._connections:
-                c.refresh()
-        elif change == QGraphicsItem.ItemScenePositionHasChanged:
+            if not self._writeback_suspended():
+                if hasattr(self.model, "x"):
+                    self.model.x = float(self.pos().x())
+                if hasattr(self.model, "y"):
+                    self.model.y = float(self.pos().y())
+            # 只需刷新一次: 顶层图元移动时 ItemPositionHasChanged 与
+            # ItemScenePositionHasChanged 都会到, 以前两个分支各刷一遍,
+            # 每条连线被重算两次。
             for c in self._connections:
                 c.refresh()
         return super().itemChange(change, value)
+
+    def _writeback_suspended(self) -> bool:
+        """程序化重建(载入/撤销恢复)期间禁止坐标回写。
+
+        重建时对"坐标为 0,0"的老元件会做兜底摆放(如 bus.x+20),
+        若此时回写 model, 兜底坐标就被当成用户布局存盘 —— 元件位置
+        会随着每次载入/撤销无意识漂移。"""
+        sc = self.scene()
+        return bool(sc is not None and getattr(sc, "_suspend_writeback", False))
+
 
     def hoverEnterEvent(self, event):
         self._hovered = True
@@ -239,8 +292,7 @@ class BusItem(BaseComponent):
         super().__init__(model)
         self._v_label = QGraphicsTextItem("", self)
         self._v_label.setDefaultTextColor(QColor(0, 80, 0))
-        f = QFont(); f.setPointSize(8)
-        self._v_label.setFont(f)
+        self._v_label.setFont(_font(8))
 
     def _init_ports(self):
         # 母线: 4 个端口 (左/右/上/下)
@@ -253,22 +305,26 @@ class BusItem(BaseComponent):
         painter.setRenderHint(QPainter.Antialiasing)
         rect = QRectF(0, 0, self.W, self.H)
         # 计算填色(基于电压)
-        v_pu = self.scene().network.bus_voltage_pu.get(self.model.uid) if self.scene() else None
-        fill = voltage_color(v_pu)
-        painter.setBrush(fill)
-        painter.setPen(self.selection_pen(QPen(COLOR_BUS, 2)))
+        sc = self.scene()
+        net = sc.network if sc is not None else None
+        v_pu = net.bus_voltage_pu.get(self.model.uid) if net is not None else None
+        dc_mode = bool(net is not None and net.result_kind == "dc")
+        painter.setBrush(voltage_color(v_pu, dc_mode=dc_mode))
+        painter.setPen(self.selection_pen(_PEN_BUS))
         painter.drawRoundedRect(rect, 6, 6)
         # 画 "≡" 母线符号 — use QLineF so float coords work
-        painter.setPen(QPen(Qt.black, 2))
+        painter.setPen(_PEN_BLACK_2)
         for i in range(3):
             y = self.H * 0.3 + i * (self.H * 0.2)
             painter.drawLine(QLineF(self.W * 0.15, y, self.W * 0.85, y))
         # 电压数值 (标签模式可在视图菜单切换 pu / kV)
-        if v_pu is None:
+        if dc_mode:
+            txt = "DC"               # 直流潮流下电压幅值无物理意义
+        elif v_pu is None:
             txt = f"{self.model.vn_kv:.0f} kV"
         elif v_pu != v_pu:
             txt = "未连通"          # NaN: 孤立母线
-        elif getattr(self.scene(), "v_label_mode", "pu") == "kv":
+        elif getattr(sc, "v_label_mode", "pu") == "kv":
             txt = f"{v_pu * self.model.vn_kv:.1f} kV"
         else:
             txt = f"{v_pu:.3f} pu"
@@ -292,11 +348,11 @@ class GenItem(BaseComponent):
         # 发电机: 圆圈 + 内部 "G"
         r = min(self.W, self.H) / 2 - 4
         cx, cy = self.W / 2, self.H / 2
-        painter.setBrush(QBrush(COLOR_GEN_FILL))
-        painter.setPen(self.selection_pen(QPen(COLOR_GEN, 2)))
+        painter.setBrush(_BRUSH_GEN_FILL)
+        painter.setPen(self.selection_pen(_PEN_GEN))
         painter.drawEllipse(QPointF(cx, cy), r, r)
-        painter.setPen(QPen(Qt.black, 2))
-        painter.setFont(QFont("Arial", 12, QFont.Bold))
+        painter.setPen(_PEN_BLACK_2)
+        painter.setFont(_font(12, bold=True))
         painter.drawText(QRectF(0, 0, self.W, self.H), Qt.AlignCenter, "G")
 
 
@@ -309,8 +365,8 @@ class LoadItem(BaseComponent):
 
     def paint(self, painter, option, widget):
         painter.setRenderHint(QPainter.Antialiasing)
-        painter.setBrush(QBrush(COLOR_LOAD_FILL))
-        painter.setPen(self.selection_pen(QPen(COLOR_LOAD, 2)))
+        painter.setBrush(_BRUSH_LOAD_FILL)
+        painter.setPen(self.selection_pen(_PEN_LOAD))
         # 负荷: 三角形 (▽)
         poly = QPolygonF([
             QPointF(self.W / 2, self.H - 4),
@@ -318,8 +374,8 @@ class LoadItem(BaseComponent):
             QPointF(self.W - 4, 4),
         ])
         painter.drawPolygon(poly)
-        painter.setPen(QPen(Qt.black, 2))
-        painter.setFont(QFont("Arial", 10, QFont.Bold))
+        painter.setPen(_PEN_BLACK_2)
+        painter.setFont(_font(10, bold=True))
         painter.drawText(QRectF(0, 0, self.W, self.H), Qt.AlignCenter, "L")
 
 
@@ -327,6 +383,10 @@ class LineCompItem(BaseComponent):
     """中间连线型元件(变压器 / 阻抗), 画为水平连线 + 中间方块"""
     KIND = "Base"
     HAS_PORTS = True
+    LINE_COLOR = COLOR_LINE
+    SYMBOL = "?"
+    _base_pen = _PEN_LINECOMP
+    _mid_pen = _PEN_LINECOMP_MID
 
     def _init_ports(self):
         self.add_port("p1", 0, self.H / 2)
@@ -334,19 +394,17 @@ class LineCompItem(BaseComponent):
 
     def paint(self, painter, option, widget):
         painter.setRenderHint(QPainter.Antialiasing)
-        painter.setPen(QPen(self.LINE_COLOR, 3))
-        if self.isSelected():
-            painter.setPen(QPen(Qt.red, 4))
+        painter.setPen(self.selection_pen(self._base_pen))
         # Use QLineF so the (H/2) float coordinate works under PyQt5
         # (the (int, int, int, int) overload rejects float in PyQt5).
         painter.drawLine(QLineF(0, self.H / 2, self.W, self.H / 2))
         # 中间标识
         rect = QRectF(self.W * 0.35, 4, self.W * 0.30, self.H - 8)
-        painter.setBrush(QBrush(Qt.white))
-        painter.setPen(QPen(self.LINE_COLOR, 2))
+        painter.setBrush(_BRUSH_WHITE)
+        painter.setPen(self._mid_pen)
         painter.drawRect(rect)
-        painter.setPen(QPen(Qt.black, 1))
-        painter.setFont(QFont("Arial", 9, QFont.Bold))
+        painter.setPen(_PEN_BLACK_1)
+        painter.setFont(_font(9, bold=True))
         painter.drawText(rect, Qt.AlignCenter, self.SYMBOL)
 
 
@@ -354,12 +412,16 @@ class TrafoItem(LineCompItem):
     KIND = "Trafo"
     LINE_COLOR = COLOR_TRAFO
     SYMBOL = "T"
+    _base_pen = _PEN_TRAFO
+    _mid_pen = _PEN_TRAFO_MID
 
 
 class ImpedanceItem(LineCompItem):
     KIND = "Impedance"
     LINE_COLOR = COLOR_IMP
     SYMBOL = "Z"
+    _base_pen = _PEN_IMP
+    _mid_pen = _PEN_IMP_MID
 
 
 class ShuntItem(BaseComponent):
@@ -374,7 +436,7 @@ class ShuntItem(BaseComponent):
 
     def paint(self, painter, option, widget):
         painter.setRenderHint(QPainter.Antialiasing)
-        painter.setPen(self.selection_pen(QPen(self.COLOR, 2)))
+        painter.setPen(self.selection_pen(_PEN_SHUNT))
         # 引线: 顶部中点 → 极板区
         plate_top = self.H * 0.45
         painter.drawLine(QLineF(self.W / 2, 0, self.W / 2, plate_top - 7))
@@ -385,10 +447,6 @@ class ShuntItem(BaseComponent):
                                 self.W / 2 + w2 / 2, plate_top - 7))
         painter.drawLine(QLineF(self.W / 2 - w2 / 2, plate_top + 7,
                                 self.W / 2 + w2 / 2, plate_top + 7))
-        painter.setPen(QPen(Qt.black, 1))
-        painter.setFont(QFont("Arial", 9, QFont.Bold))
-        painter.drawText(QRectF(0, 0, self.W * 0.3, self.H),
-                         Qt.AlignCenter, "")
 
 
 def kind_of(item) -> str:
@@ -424,11 +482,11 @@ class ConnectionItem(QGraphicsPathItem):
         # 判断是哪类连接: 母线-母线 是线路; 母线-母线 通过变压器/阻抗也是对应分支
         self.kind = "Line"   # 默认; 由 canvas 在创建后根据两端元件修正
         self.uid: Optional[str] = None   # 创建后由 canvas 写入 net.lines / trafos / imp 的 uid
+        self.rebind_prev_bus: Optional[str] = None   # Visual 连线: 建连前的挂接母线
         self.loading_color: Optional[QColor] = None   # 运行潮流后按负载率着色
         self._label = QGraphicsTextItem("", self)
         self._label.setDefaultTextColor(Qt.darkMagenta)
-        f = QFont(); f.setPointSize(7); f.setBold(True)
-        self._label.setFont(f)
+        self._label.setFont(_font(7, bold=True))
         self.setFlag(QGraphicsItem.ItemIsSelectable, True)
         self.setZValue(-1)   # 置于元件之下
         self.refresh()
@@ -487,7 +545,7 @@ class CircuitView(QGraphicsView):
         # Accept drops from the component palette.
         self.setAcceptDrops(True)
         self._drag_kind: Optional[str] = None  # kind while a drag is over us
-        self._move_before = None   # 拖动前的网络快照, 用于移动撤销
+        self._press_positions: Optional[Dict[str, tuple]] = None  # 按下时各元件坐标
 
     # ---- Drag and drop ----
     def dragEnterEvent(self, event):
@@ -597,24 +655,81 @@ class CircuitView(QGraphicsView):
             if item is None:
                 # 点空白处: 取消选中 (否则选中状态没有取消途径)
                 self.scene().clearSelection()
-            # 记录拖动前快照(移动撤销用); 快照函数由 MainWindow 提供
-            self._move_before = None
-            win = self.window()
-            if hasattr(win, "snapshot_network"):
-                self._move_before = win.snapshot_network()
+            # 按下时不再全量序列化整张网络 —— 点空白、点选也要付这个代价
+            # 太亏(118 母线下每点一次都是一次深拷贝+JSON)。这里只记下
+            # 可能被拖动的那几个元件的坐标, 释放时若真的动了, 再用这份
+            # 坐标把快照里的位置改回去, 序列化最多发生一次。
+            self._press_positions = self._record_move_positions(item)
         super().mousePressEvent(event)
+
+    def _record_move_positions(self, item) -> Dict[str, tuple]:
+        """记下本次按下可能被拖动的元件的当前 (x, y)"""
+        comps = [it for it in self.scene().selectedItems()
+                 if isinstance(it, BaseComponent)]
+        if item is not None and not isinstance(item, BaseComponent):
+            parent = item.parentItem()      # 点在名称标签/装饰子项上
+            if isinstance(parent, BaseComponent):
+                item = parent
+        if isinstance(item, BaseComponent) and item not in comps:
+            comps.append(item)
+        out: Dict[str, tuple] = {}
+        for it in comps:
+            m = it.model
+            if hasattr(m, "x") and hasattr(m, "y"):
+                out[m.uid] = (float(m.x), float(m.y))
+        return out
+
+    def _has_moved(self, positions: Dict[str, tuple]) -> bool:
+        net = self.scene().network
+        for key in ("buses", "gens", "loads", "trafos", "impedances", "shunts"):
+            for m in getattr(net, key, {}).values():
+                rec = positions.get(getattr(m, "uid", None))
+                if rec is not None and hasattr(m, "x"):
+                    if (float(m.x), float(m.y)) != rec:
+                        return True
+        return False
+
+    @staticmethod
+    def _patch_snapshot(snapshot: dict, positions: Dict[str, tuple]) -> dict:
+        """把快照里若干元件的位置改回按下前的坐标(浅拷贝, 不污染原快照)"""
+        out = {}
+        for key, val in snapshot.items():
+            out[key] = [dict(e) for e in val] if isinstance(val, list) else val
+        for entries in out.values():
+            if not isinstance(entries, list):
+                continue
+            for entry in entries:
+                pos = positions.get(entry.get("uid"))
+                if pos is not None:
+                    entry["x"], entry["y"] = pos
+        return out
 
     def _start_connection_from_port(self, port, event):
         """Initialise rubber-band state for drawing a connection from `port`."""
+        self._cleanup_pending_connection()   # 防上次残留的中间态
         self._pending_port = port
         path = QPainterPath(port.scenePos())
         # QGraphicsView.mapToScene accepts QPoint (int). event.pos() can be
         # QPoint or QPointF depending on PyQt5 version, so normalise.
         path.lineTo(self.mapToScene(event.pos().toPoint() if hasattr(event.pos(), "toPoint") else event.pos()))
         self._rubber_line = QGraphicsPathItem(path)
-        self._rubber_line.setPen(QPen(Qt.darkGray, 1.5))
+        self._rubber_line.setPen(_PEN_DARKGRAY)
         self._rubber_line.setZValue(-2)
         self.scene().addItem(self._rubber_line)
+
+    def _cleanup_pending_connection(self) -> None:
+        """原子地清理拖线中间态(橡皮线 + 起始端口)。
+
+        以前只在 "_pending_port 与 _rubber_line 同时非空" 时才清理,
+        异常路径下 _pending_port 会残留, 下一次在端口上按下就多出
+        一条泄漏的橡皮线。释放 / ESC / 重新开始 三处共用这一个出口。
+        """
+        line = self._rubber_line
+        self._rubber_line = None
+        self._pending_port = None
+        if line is not None and line.scene() is not None:
+            self.scene().removeItem(line)
+
 
     def mouseMoveEvent(self, event):
         if self._pending_port and self._rubber_line:
@@ -645,19 +760,18 @@ class CircuitView(QGraphicsView):
                 b_item = target.parentItem()
                 if a_item is not b_item:
                     self.scene().create_connection(a_item, self._pending_port, b_item, target)
-            self.scene().removeItem(self._rubber_line)
-            self._rubber_line = None
-            self._pending_port = None
+            self._cleanup_pending_connection()
             event.accept()
             return
-        # 普通点击/拖动结束: 若元件被移动, 把移动作为一次撤销入栈
-        if self._move_before is not None:
+        # 普通点击/拖动结束: 只有真的发生位移才把移动作为一次撤销入栈
+        if self._press_positions:
             win = self.window()
-            if hasattr(win, "push_move_undo"):
+            if hasattr(win, "snapshot_network") and hasattr(win, "push_move_undo") \
+                    and self._has_moved(self._press_positions):
                 after = win.snapshot_network()
-                if after != self._move_before:
-                    win.push_move_undo(self._move_before, after)
-            self._move_before = None
+                before = self._patch_snapshot(after, self._press_positions)
+                win.push_move_undo(before, after)
+            self._press_positions = None
         super().mouseReleaseEvent(event)
 
     def _find_release_target(self, view_pos):
@@ -702,6 +816,12 @@ class CircuitView(QGraphicsView):
         """右键菜单: 元件=重命名/删除, 连线=删除, 空白=运行潮流/适配视图"""
         menu = QMenu(self)
         item = self.itemAt(event.pos())
+        # 右键落在端口小圆点上时 itemAt 返回 PortItem —— 它既不是元件也不是
+        # 连线, 以前会掉进"空白"分支弹出与上下文无关的菜单。上溯到元件。
+        if isinstance(item, PortItem):
+            parent = item.parentItem()
+            if isinstance(parent, BaseComponent):
+                item = parent
         win = self.window()
         # 多选时的对齐/分布
         sel_comps = [it for it in self.scene().selectedItems()
@@ -758,10 +878,8 @@ class CircuitView(QGraphicsView):
     def keyPressEvent(self, event):
         # ESC: 正在拖连线则取消拖拽, 否则取消选中
         if event.key() == Qt.Key_Escape:
-            if self._pending_port and self._rubber_line:
-                self.scene().removeItem(self._rubber_line)
-                self._rubber_line = None
-                self._pending_port = None
+            if self._pending_port or self._rubber_line:
+                self._cleanup_pending_connection()
                 event.accept()
                 return
             if self.scene().selectedItems():
@@ -805,6 +923,11 @@ class CircuitScene(QGraphicsScene):
         self.snap_grid = 10.0
         self.selection_changed_handler = None
         self._view = None  # set by set_view() after construction
+        # 程序化重建(载入/撤销恢复)期间挂起坐标回写, 防止兜底坐标被写进
+        # model 并在下次保存时落盘(元件位置无意识漂移)
+        self._suspend_writeback = False
+        self._grid_cache = None
+        self._grid_cache_key = None
         # 表驱动: kind -> (model 工厂, model 存入的 network 字典, Item 类)
         # 加新元件类型只需: solver 加 dataclass + 这里加一行 + properties 加表单
         self._builders = {
@@ -870,20 +993,40 @@ class CircuitScene(QGraphicsScene):
                 return candidate
 
     def drawBackground(self, painter, rect):
-        """网格对齐开启时绘制背景参考线"""
+        """网格对齐开启时绘制背景参考线。
+
+        网格以前是每帧现算现画: 2000×1400 / 50px ≈ 1120 条 QLineF,
+        平移或缩放的每一帧都来一遍。现在预渲染到一张 QPixmap,
+        只有 sceneRect / 网格粒度变化时才重建。
+        """
         super().drawBackground(painter, rect)
         if not self.snap_enabled:
             return
+        painter.drawPixmap(self.sceneRect().topLeft(), self._grid_pixmap())
+
+    def _grid_pixmap(self):
+        r = self.sceneRect()
+        key = (r.width(), r.height(), self.snap_grid)
+        if self._grid_cache is not None and self._grid_cache_key == key:
+            return self._grid_cache
         step = self.snap_grid * 5   # 50px 一格, 10px 吸附粒度太密不适合画线
-        painter.setPen(QPen(QColor(225, 225, 225), 1))
-        x = int(rect.left() // step) * step
-        while x < rect.right():
-            painter.drawLine(QLineF(x, rect.top(), x, rect.bottom()))
+        w, h = max(1, int(r.width())), max(1, int(r.height()))
+        pm = QPixmap(w, h)
+        pm.fill(Qt.transparent)
+        p = QPainter(pm)
+        p.setPen(_PEN_GRID)
+        x = 0.0
+        while x <= w:
+            p.drawLine(QLineF(x, 0, x, h))
             x += step
-        y = int(rect.top() // step) * step
-        while y < rect.bottom():
-            painter.drawLine(QLineF(rect.left(), y, rect.right(), y))
+        y = 0.0
+        while y <= h:
+            p.drawLine(QLineF(0, y, w, y))
             y += step
+        p.end()
+        self._grid_cache = pm
+        self._grid_cache_key = key
+        return pm
 
     def snap_point(self, x: float, y: float) -> tuple:
         """网格对齐开启时把坐标吸附到网格; 关闭时原样返回"""
@@ -909,10 +1052,6 @@ class CircuitScene(QGraphicsScene):
         item.setPos(x, y)
         self.addItem(item)
         self._comp_by_uid[uid] = item
-
-        # gen / load 自动创建到母线的"内部连接"记录(只是拓扑关系, 不画线)
-        if kind in ("Gen", "Load"):
-            self._register_internal_link(item, model.bus_uid)
 
         return item
 
@@ -951,16 +1090,40 @@ class CircuitScene(QGraphicsScene):
         return best
 
     def _register_internal_link(self, comp_item: BaseComponent, bus_uid: str):
-        """记录 gen/load 与母线的逻辑连接, 用于删除元件时联动清理"""
-        if not hasattr(self, "_internal_links"):
-            self._internal_links: Dict[str, List[str]] = {}
-        self._internal_links.setdefault(bus_uid, []).append(comp_item.model.uid)
+        """[兼容保留] Gen/Load 与母线的挂接关系现在由 network 实时派生,
+        无需登记; 保留此方法只为不破坏既有调用方。"""
+        return
+
+    @property
+    def _internal_links(self) -> Dict[str, List[str]]:
+        """挂在每条母线上的 Gen/Load —— 由 network 实时派生的视图。
+
+        旧实现是一份手工维护的缓存: 删元件、改挂接母线时必须记得同步,
+        否则留下失效 uid (删母线时会做一次无害却无意义的 _remove_component)。
+        改成派生视图后永远与 network 一致, 不存在"忘了同步"这类 bug。
+        """
+        links: Dict[str, List[str]] = {}
+        for uid, g in self.network.gens.items():
+            links.setdefault(g.bus_uid, []).append(uid)
+        for uid, l in self.network.loads.items():
+            links.setdefault(l.bus_uid, []).append(uid)
+        return links
 
     def create_connection(self, a_item: BaseComponent, a_port: PortItem,
                           b_item: BaseComponent, b_port: PortItem) -> Optional[ConnectionItem]:
         # Reject self-loops immediately
         if a_item is b_item:
             return
+        # 同一对端口上重复拉线: 以前每次都会新建一条 Line 并写进
+        # network.lines, 手一抖就是一条"看不见的并联线路"。这里挡掉,
+        # 想要真正并联的两回线请用母线上不同的端口连。
+        for c in self._connections:
+            if {id(c.a_port), id(c.b_port)} == {id(a_port), id(b_port)}:
+                if self._view is not None:
+                    win = self._view.window()
+                    if hasattr(win, "status"):
+                        win.status.showMessage("这两个端口之间已经有连线了", 3000)
+                return None
         # Gen / Load are bound to a bus at add-time (bus_uid on the model).
         # User-drawn lines to / from them are visual hints — the topology
         # mutation below only runs for real Bus <-> Bus, Bus <-> LineComp
@@ -1016,22 +1179,26 @@ class CircuitScene(QGraphicsScene):
             conn.kind = "LineComp-Link"
             conn.uid = ""
         else:
-            # Gen/Load 拖线连到母线: 把挂接关系转正 (bus_uid 改写)。
+            # Gen/Load/Shunt 拖线连到母线: 把挂接关系转正 (bus_uid 改写)。
             # 以前这种线只是视觉装饰, 用户把 Gen 拖线连到 B3, 实际拓扑
-            # 还挂在 B1 —— 语义陷阱。现在真正改挂接母线。
-            genload = None
+            # 还挂在 B1 —— 语义陷阱; 而且从 Shunt 拖线压根不在匹配范围,
+            # 视觉在 B2、拓扑还在 B1。现在统一真正改挂接母线, 并把改前的
+            # 母线记在连线上, 删除该连线时对称地退回去。
+            mover = None
             bus = None
             for x_item, y_item in ((a_item, b_item), (b_item, a_item)):
-                if isinstance(x_item, (GenItem, LoadItem)) and isinstance(y_item, BusItem):
-                    genload, bus = x_item, y_item
+                if isinstance(x_item, (GenItem, LoadItem, ShuntItem)) \
+                        and isinstance(y_item, BusItem):
+                    mover, bus = x_item, y_item
                     break
-            if genload is not None:
-                self._rebind_genload_to_bus(genload, bus)
-            # Gen / Load: just draw a visual line. Topology is bound
-            # by the bus_uid recorded when the component was added.
+            prev_bus = None
+            if mover is not None:
+                prev_bus = mover.model.bus_uid
+                self._rebind_genload_to_bus(mover, bus)
             conn = ConnectionItem(a_item, a_port, b_item, b_port)
             conn.kind = "Visual"
             conn.uid = ""
+            conn.rebind_prev_bus = prev_bus
 
         self.addItem(conn)
         a_item.register_connection(conn)
@@ -1039,17 +1206,15 @@ class CircuitScene(QGraphicsScene):
         self._connections.append(conn)
 
     def _rebind_genload_to_bus(self, comp_item, bus_item) -> None:
-        """把 Gen/Load 的挂接母线改到 bus_item (拖线换母线的拓扑转正)"""
+        """把 Gen/Load/Shunt 的挂接母线改到 bus_item (拖线换母线的拓扑转正)
+
+        `_internal_links` 由 network 派生, 改完 model 即自动一致, 无需同步。
+        """
         old_uid = comp_item.model.bus_uid
         new_uid = bus_item.model.uid
         if old_uid == new_uid:
             return
         comp_item.model.bus_uid = new_uid
-        if hasattr(self, "_internal_links"):
-            old_list = self._internal_links.get(old_uid)
-            if old_list and comp_item.model.uid in old_list:
-                old_list.remove(comp_item.model.uid)
-            self._internal_links.setdefault(new_uid, []).append(comp_item.model.uid)
         if self._view is not None:
             win = self._view.window()
             if hasattr(win, "status"):
@@ -1113,8 +1278,6 @@ class CircuitScene(QGraphicsScene):
             item.setPos(model.x, model.y)
             self.addItem(item)
             self._comp_by_uid[new_uid] = item
-            if kind in ("Gen", "Load"):
-                self._register_internal_link(item, model.bus_uid)
             new_items.append(item)
         # 两端都在复制集内的线路: 复制模型并重建连线
         for ln in list(self.network.lines.values()):
@@ -1156,10 +1319,10 @@ class CircuitScene(QGraphicsScene):
             if kind == "Bus":
                 self.network.buses.pop(uid, None)
                 # 挂接在这个母线上的 gen/load: model 和图形项一起删
-                if hasattr(self, "_internal_links") and uid in self._internal_links:
-                    for child_uid in list(self._internal_links[uid]):
-                        self._remove_component(child_uid)
-                    self._internal_links.pop(uid, None)
+                # (_internal_links 由 network 派生, 此时 gens/loads 仍指向
+                #  该母线 uid, 因此派生视图依然能列出它们)
+                for child_uid in list(self._internal_links.get(uid, [])):
+                    self._remove_component(child_uid)
                 # 以该母线为端点的线路/变压器/阻抗: model 和图形项一起删
                 self._purge_branches_on_bus(uid)
                 # 挂在该母线上的电容/电抗同样级联删除(model+图形项), 防孤儿引用
@@ -1194,6 +1357,16 @@ class CircuitScene(QGraphicsScene):
                     self._connections.remove(item)
                 self._remove_component(comp.model.uid)
                 return
+            # 视觉连线(Gen/Load/Shunt ↔ 母线): 建连时把挂接母线改到了另一端,
+            # 断连必须对称地退回去 —— 否则界面显示"已断开", 元件却仍挂在
+            # 目标母线上参与计算, 用户完全看不出来。
+            if item.kind == "Visual" and getattr(item, "rebind_prev_bus", None):
+                mover = next((c for c in (item.a_comp, item.b_comp)
+                              if isinstance(c, (GenItem, LoadItem, ShuntItem))),
+                             None)
+                if mover is not None:
+                    mover.model.bus_uid = item.rebind_prev_bus
+                    item.rebind_prev_bus = None
             self.removeItem(item)
             if item in self._connections:
                 self._connections.remove(item)
@@ -1241,6 +1414,12 @@ class CircuitScene(QGraphicsScene):
 
     # ------- 结果可视化刷新 -------
     def refresh_results(self) -> None:
+        """按最新结果重绘现有图元。
+
+        注意这里**不重算连线几何**: 结果只改连线标签文字与颜色, 端点位置
+        没变, 旧版每条连线都调一次 refresh() 纯属白算(N-1 循环里会被反复
+        触发)。几何变化由 itemChange 负责。
+        """
         # 重画所有 BusItem (更新电压色), 并更新 hover 提示
         for uid, item in self._comp_by_uid.items():
             if isinstance(item, BusItem):
@@ -1274,7 +1453,6 @@ class CircuitScene(QGraphicsScene):
                                 if loading is not None and p_from is not None else ""))
                 c.loading_color = loading_color(loading)
                 c.update()
-                c.refresh()
             elif c.kind == "Trafo" and c.uid and c.uid in self.network.trafos:
                 loading = self.network.trafo_loading_percent.get(c.uid)
                 p_hv = self.network.trafo_p_hv_mw.get(c.uid)
@@ -1287,7 +1465,6 @@ class CircuitScene(QGraphicsScene):
                                 if loading is not None and p_hv is not None else ""))
                 c.loading_color = loading_color(loading)
                 c.update()
-                c.refresh()
 
 
 def apply_alignment(scene, mode: str) -> int:

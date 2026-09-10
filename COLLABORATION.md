@@ -45,12 +45,20 @@
 
 ```
 PowerFlowStudio/
-├── app.py          — 主入口 (MainWindow, 工具栏, IO, demo)
+├── app.py          — 主入口 (MainWindow, 工具栏, IO, demo, 后台计算线程)
 ├── canvas.py       — 画布 (QGraphicsView/Scene, BaseComponent, PortItem, ConnectionItem)
-├── palette.py      — 元件库面板 (5 个 QPushButton + QDrag)
-├── properties.py   — 属性编辑面板 (QFormLayout, 左侧参数 + 右侧潮流结果)
-├── solver.py       — 拓扑↔pandapower 转换 + Newton-Raphson
-├── tests/          — pytest: test_solver.py(17用例) + test_gui_smoke.py(offscreen)
+├── palette.py      — 元件库面板 (6 个 QPushButton + QDrag)
+├── properties.py   — 属性编辑面板 (滚动 QFormLayout, 参数 + 潮流结果)
+├── results.py      — 结果 dock (母线/支路表, 电压与相角图, CSV/SVG 导出)
+├── ux.py           — 小地图 / 搜索定位 / 对齐分布
+├── solver.py       — 拓扑↔pandapower 转换 + 潮流/OPF/短路/N-1
+├── topo_io.py      — 拓扑 JSON 存取与校验 (原子写)
+├── ieee_cases.py   — pandapower 标准算例反向转换
+├── theme.py        — 外观 / 高分屏 / 分辨率适配 / 窗体尺寸计算
+├── defaults.py     — 默认参数与字段范围 (单一事实来源)
+├── undocmds.py     — 快照式撤销命令
+├── tools/          — 截图与辅助脚本
+├── tests/          — pytest: test_solver.py + test_gui_smoke.py(offscreen) + test_e2e_journey.py
 ├── requirements.txt / requirements-dev.txt — 锁版本依赖
 ├── build_windows.bat  — Windows 一键打包
 └── README.md       — 用户使用说明
@@ -161,15 +169,20 @@ class MatpowerBackend: ...    # 未来
 
 ### D. 测试
 
-**现状**：solver 单元测试是 ad-hoc 脚本，没有 CI。
+**现状**：已落地 —— 151 个 pytest 用例 (solver 单元 + GUI offscreen 冒烟)，
+GitHub Actions 双平台 CI。CI 分两个 job：
+
+- `pytest`: 每次 push / PR 在 Ubuntu + Windows 跑, 含 `compileall` 全模块字节码检查
+- `package-smoke`: **仅打 tag 或手动触发**时跑, 用 PyInstaller 真打一次单文件 exe,
+  校验体积下限并实际启动进程存活 25 秒 (漏收动态导入这类问题只有真打包才暴露)
 
 **建议**：
 - 至少给 `solver.py` 写 pytest，覆盖：
   - 3 母线例题（已知电压/相角）
   - 5 母线两端供电（功率平衡）
   - 收敛失败（阻抗过大）
-- GUI 测试用 `QT_QPA_PLATFORM=offscreen` + pytest-qt
-- CI：GitHub Actions 跑 pytest + Windows 打包
+- GUI 测试用 `QT_QPA_PLATFORM=offscreen` + pytest-qt ✓（已用 offscreen, 未引入 pytest-qt）
+- CI：GitHub Actions 跑 pytest + Windows 打包 ✓
 
 ### E. 可视化
 
@@ -263,15 +276,22 @@ A: pandapower 自带：`pp.networks.case14()`。在 `app.py:_load_demo` 加按�
 
 ## 八、版本
 
-最后同步：2026-09-10 通宵迭代后（app.py `__version__ = "0.6.0"`，分支 `autopilot/311078d40f81`）。
+最后同步：2026-09-10 二代迭代后（app.py `__version__ = "0.7.1"`，分支 `autopilot/311078d40f81`）。
 
 **本轮新增能力**（详见 README 功能清单与 `optimize(round-N)` 提交记录）：
-- ✅ 93 个 pytest 用例（solver 单元 + GUI offscreen 冒烟），GitHub Actions 双平台 CI
+- ✅ 151 个 pytest 用例（solver 单元 + GUI offscreen 冒烟），GitHub Actions 双平台 CI
 - ✅ 高危 bug 清零（详见第三节已修清单）
 - ✅ 撤销/重做（含拖动）、复制粘贴、网格对齐、滚轮缩放、右键菜单
 - ✅ AC/DC 双模式、可选平衡节点、N-1 校核
 - ✅ IEEE 14/24/30/39/57/118 一键加载
-- ✅ 结果总览（表/电压图/相角图）、CSV 导出、PNG 导出、自动保存
+- ✅ 结果总览（表/电压图/相角图）、CSV 导出、PNG/SVG 导出、自动保存
+- ✅ OPF 最优潮流、三相短路、并联电容/电抗器、变压器分接头
+- ✅ 高分屏与分辨率自适应（`theme.py`）：4K(含非整数缩放)～1366×768，
+  旧窗口/分栏几何先校验再恢复，避免"画布只剩一百多像素"的哑状态
+
+**模块清单**（新增模块请同步更新 CI 的 `Byte-compile all modules` 列表）：
+`app.py` `canvas.py` `palette.py` `properties.py` `results.py` `ux.py`
+`solver.py` `topo_io.py` `ieee_cases.py` `theme.py` `defaults.py` `undocmds.py`
 
 **基线已大幅推进，无需回退到 `4859b2e`**；如需对比，`git log --oneline` 中
 `optimize(round-*)` 即本轮全部提交。

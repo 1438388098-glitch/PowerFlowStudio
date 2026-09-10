@@ -3,7 +3,7 @@ solver.py — 把画布上的元件/连线拓扑转换成 pandapower 网络, 跑
 """
 from __future__ import annotations
 from dataclasses import dataclass, field
-from typing import Dict, Tuple
+from typing import Dict, List, Tuple
 
 import pandapower as pp
 
@@ -47,6 +47,12 @@ class GenUnit:
     rx_max: float = 0.1            # R/X 比 (最大)
     rx_min: float = 0.1
     kappa: float = 1.5             # 峰值系数
+    # ---- 机组短路铭牌参数 (PV 机组参与短路计算时使用) ----
+    # 以前写死 xdss=18%/rdss=1%/cosφ=0.85, 真实 x''d 在 12%~25% 波动,
+    # 会让 Ikss 出现 10%~30% 偏差, 而短路计算正是用来校验遮断能力的。
+    xdss_percent: float = D.GEN_XDSS_PERCENT   # 次暂态电抗 x''d (%)
+    rdss_percent: float = D.GEN_RDSS_PERCENT   # 次暂态电阻 r''d (%)
+    cos_phi: float = D.GEN_COS_PHI             # 额定功率因数
 
 
 @dataclass
@@ -103,6 +109,7 @@ class TrafoBranch:
     i0_percent: float = 0.0
     shift_degree: float = 0.0
     tap_pos: int = 0               # 分接头位置 (-2..2, 0 为中性)
+    vector_group: str = "Dyn"      # 联结组别 (Dyn/Yy/Yd 等, 影响零序与相移)
     x: float = 0.0                 # 画布坐标 (0,0 表示未记录, 载入时按中点摆放)
     y: float = 0.0
 
@@ -167,11 +174,30 @@ class Network:
     total_loss_q_mvar: float = 0.0
     converged: bool = False
     error_msg: str = ""
+    # 结果来源: "" / "ac" / "dc" / "opf" / "sc"
+    # DC 模式下 vm_pu 恒为 1.0、Q 恒为 0, 界面必须据此改换着色与标注,
+    # 否则用户会误以为"所有母线电压都正好是额定值"。
+    result_kind: str = ""
+    # 非致命提示(孤立母线等): 求解仍成功, 但需要提醒用户注意
+    warnings: List[str] = field(default_factory=list)
 
 
 # ============================================================
 # 2. 拓扑 -> pandapower
 # ============================================================
+
+# 元件类型 -> 该类型引用了母线的字段。
+# 校验 / 解析 / 序列化全部以此为准: 新增元件类型只改这一处,
+# 不会再出现"某个入口忘了校验某类元件"的漏网(P0-1 的根因)。
+# 结构: (Network 属性名, 中文标签, 引用母线的字段名元组)
+BUS_REF_SPEC = (
+    ("gens", "发电机", ("bus_uid",)),
+    ("loads", "负荷", ("bus_uid",)),
+    ("lines", "线路", ("from_bus", "to_bus")),
+    ("trafos", "变压器", ("hv_bus", "lv_bus")),
+    ("impedances", "阻抗", ("from_bus", "to_bus")),
+    ("shunts", "电容/电抗", ("bus_uid",)),
+)
 
 # 结果回写字段清单(清空旧结果 / 批量操作时遍历用)
 _RESULT_FIELDS = (
@@ -196,6 +222,8 @@ def _clear_results(net: Network):
     net.total_loss_q_mvar = 0.0
     net.converged = False
     net.error_msg = ""
+    net.result_kind = ""
+    net.warnings = []
 
 
 def build_pandapower(net: Network, for_opf: bool = False) -> Tuple[pp.pandapowerNet, Dict[str, Dict]]:
@@ -323,27 +351,31 @@ def build_pandapower(net: Network, for_opf: bool = False) -> Tuple[pp.pandapower
         id_maps["load"][pp_id] = uid
 
     # 自定义一个 GUI 用的线路/变压器型号
-    pp.create_std_type(
-        pnet,
-        {"r_ohm_per_km": D.LINE_R_OHM_PER_KM, "x_ohm_per_km": D.LINE_X_OHM_PER_KM,
-         "c_nf_per_km": D.LINE_C_NF_PER_KM, "max_i_ka": D.LINE_MAX_I_KA,
-         "type": "cs"},
-        name="GUI_LINE",
-        element="line",
-    )
-    pp.create_std_type(
-        pnet,
-        {"sn_mva": D.TRAFO_SN_MVA, "vn_hv_kv": D.TRAFO_VN_HV_KV,
-         "vn_lv_kv": D.TRAFO_VN_LV_KV, "vk_percent": D.TRAFO_VK_PERCENT,
-         "vkr_percent": D.TRAFO_VKR_PERCENT, "pfe_kw": 0.0,
-         "i0_percent": 0.0, "shift_degree": 0.0,
-         "vector_group": "Dyn", "tap_side": "hv", "tap_neutral": 0,
-         "tap_min": -2, "tap_max": 2, "tap_step_percent": 2.5,
-         "tap_pos": 0, "tap_changer_type": "Ratio",
-         "type": "transformer"},
-        name="GUI_TRAFO",
-        element="trafo",
-    )
+    # (去重: 同一 pnet 被重复填充时不再重复注册, N-1/OPF 重跑路径上省一遍开销)
+    if "GUI_LINE" not in pnet.std_types.get("line", {}):
+        pp.create_std_type(
+            pnet,
+            {"r_ohm_per_km": D.LINE_R_OHM_PER_KM, "x_ohm_per_km": D.LINE_X_OHM_PER_KM,
+             "c_nf_per_km": D.LINE_C_NF_PER_KM, "max_i_ka": D.LINE_MAX_I_KA,
+             "type": "cs"},
+            name="GUI_LINE",
+            element="line",
+        )
+    if "GUI_TRAFO" not in pnet.std_types.get("trafo", {}):
+        pp.create_std_type(
+            pnet,
+            {"sn_mva": D.TRAFO_SN_MVA, "vn_hv_kv": D.TRAFO_VN_HV_KV,
+             "vn_lv_kv": D.TRAFO_VN_LV_KV, "vk_percent": D.TRAFO_VK_PERCENT,
+             "vkr_percent": D.TRAFO_VKR_PERCENT, "pfe_kw": 0.0,
+             "i0_percent": 0.0, "shift_degree": 0.0,
+             "vector_group": D.TRAFO_VECTOR_GROUP, "tap_side": "hv",
+             "tap_neutral": 0,
+             "tap_min": -2, "tap_max": 2, "tap_step_percent": 2.5,
+             "tap_pos": 0, "tap_changer_type": "Ratio",
+             "type": "transformer"},
+            name="GUI_TRAFO",
+            element="trafo",
+        )
 
     # 线路 — create_line 的返回值就是 pp id, 无需再去取 index[-1]
     for uid, ln in net.lines.items():
@@ -380,6 +412,10 @@ def build_pandapower(net: Network, for_opf: bool = False) -> Tuple[pp.pandapower
         pnet.trafo.at[idx, "i0_percent"] = tr.i0_percent
         pnet.trafo.at[idx, "shift_degree"] = tr.shift_degree
         pnet.trafo.at[idx, "tap_pos"] = int(tr.tap_pos)
+        # 联结组别只放行已知取值, 免得手改存档里的乱码让 calc_sc 崩掉
+        vg = str(getattr(tr, "vector_group", "") or "")
+        pnet.trafo.at[idx, "vector_group"] = (
+            vg if vg in D.TRAFO_VECTOR_GROUPS else D.TRAFO_VECTOR_GROUP)
         id_maps["trafo"][uid] = idx
 
     # 串联阻抗
@@ -413,35 +449,79 @@ def build_pandapower(net: Network, for_opf: bool = False) -> Tuple[pp.pandapower
 # 3. 跑潮流 + 回写结果到 Network
 # ============================================================
 
+# ============================================================
+# 3. 跑潮流 + 回写结果到 Network
+# ============================================================
+
+def _solve_pnet(pnet, algorithm: str = "nr", distributed_slack: bool = False):
+    """对已构建好的 pandapower 网络求解一次潮流 (NR / DC)。
+
+    单独抽出来是因为 N-1 校核要在同一个 pnet 上反复求解(逐条开断),
+    而只读结果的调用方(OPF 预热、短路预热)也需要同一套口径。
+    """
+    if algorithm == "dc":
+        # pandapower 3.x: 直流潮流是独立入口 rundcpp,
+        # runpp(algorithm="dc") 会 KeyError
+        pp.rundcpp(pnet, numba=False)
+    elif distributed_slack:
+        pp.runpp(pnet, algorithm=algorithm, init="flat", numba=False,
+                 distributed_slack=True)
+    else:
+        pp.runpp(pnet, algorithm=algorithm, init="flat", numba=False)
+
+
 def _validate_topology(net: Network) -> str:
     """跑潮流前校验拓扑引用, 返回空串表示通过, 否则返回可读的错误说明。
 
     悬空引用(元件挂接的母线已被删除)直接进 pandapower 会变成
     KeyError: '' 之类的天书, 这里提前拦下并告诉用户该修哪里。
+    遍历口径由 BUS_REF_SPEC 驱动, 新增元件类型自动纳入, 不会再漏。
     """
     bus_uids = set(net.buses)
-    for g in net.gens.values():
-        if g.bus_uid not in bus_uids:
-            return f"发电机 {g.name} 挂接的母线不存在(可能已被删除), 请重新连接"
-    for ld in net.loads.values():
-        if ld.bus_uid not in bus_uids:
-            return f"负荷 {ld.name} 挂接的母线不存在(可能已被删除), 请重新连接"
-    for ln in net.lines.values():
-        if ln.from_bus not in bus_uids or ln.to_bus not in bus_uids:
-            return f"线路 {ln.name} 的端点母线不存在(可能已被删除), 请重新连接"
+    for key, label, fields in BUS_REF_SPEC:
+        single = len(fields) == 1
+        for obj in getattr(net, key).values():
+            for fname in fields:
+                if getattr(obj, fname, "") not in bus_uids:
+                    where = "挂接的母线" if single else "的端点母线"
+                    return (f"{label} {obj.name} {where}不存在(可能已被删除), "
+                            "请重新连接")
+    # 自环与零长度: trafo 的 hv==lv 早就查了, line 的自环以前漏查 —— 不对称
     for tr in net.trafos.values():
-        if tr.hv_bus not in bus_uids or tr.lv_bus not in bus_uids:
-            return f"变压器 {tr.name} 的端点母线不存在(可能已被删除), 请重新连接"
         if tr.hv_bus == tr.lv_bus:
             return (f"变压器 {tr.name} 两侧接在同一条母线上, "
                     "请把高压/低压侧分别连到两条不同母线")
+    for ln in net.lines.values():
+        if ln.from_bus == ln.to_bus:
+            return (f"线路 {ln.name} 两端接在同一条母线上(自环), "
+                    "请把两端分别连到两条不同母线")
+        if ln.length_km <= 0:
+            return f"线路 {ln.name} 的长度必须大于 0 (当前 {ln.length_km:g} km)"
     for im in net.impedances.values():
-        if im.from_bus not in bus_uids or im.to_bus not in bus_uids:
-            return f"阻抗 {im.name} 的端点母线不存在(可能已被删除), 请重新连接"
-    for sh in net.shunts.values():
-        if sh.bus_uid not in bus_uids:
-            return f"电容/电抗 {sh.name} 挂接的母线不存在(可能已被删除), 请重新连接"
+        if im.from_bus == im.to_bus:
+            return (f"阻抗 {im.name} 两端接在同一条母线上(自环), "
+                    "请把两端分别连到两条不同母线")
     return ""
+
+
+def _collect_warnings(net: Network) -> List[str]:
+    """求解成功后仍值得提醒的非致命问题(孤立母线)。
+
+    孤立母线不会让潮流失败(结果该点是 NaN), 但用户往往以为是软件出错了,
+    所以主动说明"这些母线没接进电网"。
+    """
+    degree: Dict[str, int] = {uid: 0 for uid in net.buses}
+    for key, _label, fields in BUS_REF_SPEC:
+        for obj in getattr(net, key).values():
+            for fname in fields:
+                ref = getattr(obj, fname, "")
+                if ref in degree:
+                    degree[ref] += 1
+    isolated = [net.buses[uid].name for uid, d in degree.items() if d == 0]
+    if isolated:
+        shown = ", ".join(isolated[:8]) + ("…" if len(isolated) > 8 else "")
+        return [f"{len(isolated)} 条母线未接入电网(电压显示为 NaN): {shown}"]
+    return []
 
 
 def run_power_flow(net: Network, algorithm: str = "nr",
@@ -461,15 +541,7 @@ def run_power_flow(net: Network, algorithm: str = "nr",
 
     try:
         pnet, id_maps = build_pandapower(net)
-        if algorithm == "dc":
-            # pandapower 3.x: 直流潮流是独立入口 rundcpp,
-            # runpp(algorithm="dc") 会 KeyError
-            pp.rundcpp(pnet, numba=False)
-        elif distributed_slack:
-            pp.runpp(pnet, algorithm=algorithm, init="flat", numba=False,
-                     distributed_slack=True)
-        else:
-            pp.runpp(pnet, algorithm=algorithm, init="flat", numba=False)
+        _solve_pnet(pnet, algorithm, distributed_slack)
     except pp.LoadflowNotConverged as e:
         _fail(net, f"潮流不收敛: {e}")
         return False, net.error_msg
@@ -485,6 +557,8 @@ def run_power_flow(net: Network, algorithm: str = "nr",
         _fail(net, f"读取结果错误: {type(e).__name__}: {e}")
         return False, net.error_msg
 
+    net.result_kind = "dc" if algorithm == "dc" else "ac"
+    net.warnings = _collect_warnings(net)
     net.converged = True
     return True, ""
 
@@ -498,6 +572,46 @@ def _fail(net: Network, msg: str):
 # ============================================================
 # 4. N-1 校核 (逐条开断线路/变压器重跑潮流)
 # ============================================================
+
+def _n1_overloads(pnet, id_maps, net, loading_limit: float) -> list:
+    """从一次求解结果里挑出越限支路 (线路 + 变压器)"""
+    out = []
+    res_line = getattr(pnet, "res_line", None)
+    if res_line is not None and "loading_percent" in set(res_line.columns):
+        for uid, pp_id in id_maps["line"].items():
+            if pp_id not in res_line.index:
+                continue
+            loading = float(res_line.at[pp_id, "loading_percent"])
+            if loading == loading and loading > loading_limit:
+                ln = net.lines.get(uid)
+                out.append((f"线路 {ln.name if ln else uid}", round(loading, 1)))
+    res_trafo = getattr(pnet, "res_trafo", None)
+    if res_trafo is not None and "loading_percent" in set(res_trafo.columns):
+        for uid, pp_id in id_maps["trafo"].items():
+            if pp_id not in res_trafo.index:
+                continue
+            loading = float(res_trafo.at[pp_id, "loading_percent"])
+            if loading == loading and loading > loading_limit:
+                tr = net.trafos.get(uid)
+                out.append((f"变压器 {tr.name if tr else uid}", round(loading, 1)))
+    return out
+
+
+def _n1_isolated(pnet, id_maps, net) -> list:
+    """开断后电压为 NaN 的母线 = 被孤立的母线"""
+    res_bus = getattr(pnet, "res_bus", None)
+    if res_bus is None or "vm_pu" not in set(res_bus.columns):
+        return []
+    out = []
+    for uid, pp_id in id_maps["bus"].items():
+        if pp_id not in res_bus.index:
+            continue
+        v = float(res_bus.at[pp_id, "vm_pu"])
+        if v != v:
+            b = net.buses.get(uid)
+            out.append(b.name if b else uid)
+    return out
+
 
 def n_minus_1_check(net: Network, algorithm: str = "nr",
                     loading_limit: float = 100.0, progress=None,
@@ -514,49 +628,58 @@ def n_minus_1_check(net: Network, algorithm: str = "nr",
       overloads  [(元件描述, 负载率%)] 超过 loading_limit 的支路
       isolated   [母线名] 开断后孤立的母线
     基线未收敛时会先跑一次基线; 基线失败返回 {"_base_failed": 错误}。
+
+    实现要点: 不再对每条支路 deepcopy 整张 Network 再重建 pandapower。
+    旧写法在 case118 上要 179 次整网深拷贝 + 179 次 build + 179 次求解,
+    是 O(n²); 现在只建一次 pnet, 逐条把 in_service 置 False/True 即可,
+    语义等价(pandapower 本就把 in_service=False 的元件排除在计算外)。
     """
-    import copy as _copy
     if not net.converged:
         ok, err = run_power_flow(net, algorithm=algorithm,
                                  distributed_slack=distributed_slack)
         if not ok:
             return {"_base_failed": err}
 
-    branches = [("线路", uid, net.lines) for uid in net.lines]
-    branches += [("变压器", uid, net.trafos) for uid in net.trafos]
-    branches += [("阻抗", uid, net.impedances) for uid in net.impedances]
+    # (中文类型名, uid, pandapower 表名)
+    branches = [("线路", uid, "line") for uid in net.lines]
+    branches += [("变压器", uid, "trafo") for uid in net.trafos]
+    branches += [("阻抗", uid, "impedance") for uid in net.impedances]
     total = len(branches)
+    if total == 0:
+        return {}
 
+    try:
+        pnet, id_maps = build_pandapower(net)
+    except Exception as e:
+        return {"_base_failed": f"{type(e).__name__}: {e}"}
+
+    containers = {"线路": net.lines, "变压器": net.trafos, "阻抗": net.impedances}
     report: Dict[str, dict] = {}
-    for done, (kind, uid, container) in enumerate(branches):
+    for done, (kind, uid, table) in enumerate(branches):
         if progress is not None:
             progress(done, total)
-        name = container[uid].name
-        trial = _copy.deepcopy(net)
-        trial_branches = {"线路": trial.lines, "变压器": trial.trafos,
-                          "阻抗": trial.impedances}[kind]
-        trial_branches.pop(uid, None)
-        ok, err = run_power_flow(trial, algorithm=algorithm,
-                                 distributed_slack=distributed_slack)
-        entry = {"kind": kind, "name": name, "ok": ok,
+        entry = {"kind": kind, "name": containers[kind][uid].name, "ok": False,
                  "error": "", "overloads": [], "isolated": []}
-        if not ok:
-            entry["error"] = err
-        else:
-            for lid, loading in trial.line_loading_percent.items():
-                if loading == loading and loading > loading_limit:
-                    ln = trial.lines.get(lid)
-                    entry["overloads"].append(
-                        (f"线路 {ln.name if ln else lid}", round(loading, 1)))
-            for tid, loading in trial.trafo_loading_percent.items():
-                if loading == loading and loading > loading_limit:
-                    tr = trial.trafos.get(tid)
-                    entry["overloads"].append(
-                        (f"变压器 {tr.name if tr else tid}", round(loading, 1)))
-            for bid, v in trial.bus_voltage_pu.items():
-                if v != v:   # NaN → 孤立
-                    b = trial.buses.get(bid)
-                    entry["isolated"].append(b.name if b else bid)
+        pp_id = id_maps[table].get(uid)
+        if pp_id is None:
+            entry["error"] = "内部索引缺失, 无法校核"
+            report[uid] = entry
+            continue
+        try:
+            pnet[table].at[pp_id, "in_service"] = False
+            try:
+                _solve_pnet(pnet, algorithm, distributed_slack)
+            except pp.LoadflowNotConverged as e:
+                entry["error"] = f"潮流不收敛: {e}"
+            except Exception as e:
+                entry["error"] = f"{type(e).__name__}: {e}"
+            else:
+                entry["ok"] = True
+                entry["overloads"] = _n1_overloads(pnet, id_maps, net,
+                                                   loading_limit)
+                entry["isolated"] = _n1_isolated(pnet, id_maps, net)
+        finally:
+            pnet[table].at[pp_id, "in_service"] = True
         report[uid] = entry
     return report
 
@@ -691,8 +814,14 @@ def run_opf(net: Network) -> Tuple[bool, str]:
     try:
         pnet, id_maps = build_pandapower(net, for_opf=True)
         # 先跑一次收敛潮流: 结果既可作 OPF 初值(results), 也让用户在
-        # OPF 失败时看到基线潮流状态
-        pp.runpp(pnet, algorithm="nr", init="flat", numba=False)
+        # OPF 失败时看到基线潮流状态。
+        # 初值双保险: flat 对低阻抗环网实测不收敛, results 更稳; 反过来
+        # 简单网络 results 会发散。这里与下面的 runopp 保持同一策略 —— 都试。
+        try:
+            pp.runpp(pnet, algorithm="nr", init="flat", numba=False)
+        except pp.LoadflowNotConverged:
+            pnet, id_maps = build_pandapower(net, for_opf=True)
+            pp.runpp(pnet, algorithm="nr", init="results", numba=False)
         # 初值双保险: 低阻抗并联环网用 flat 实测不收敛, results 更稳;
         # 但部分简单网络 results 反而发散。两种初值都试, 任一收敛即成
         try:
@@ -713,6 +842,8 @@ def run_opf(net: Network) -> Tuple[bool, str]:
         _fail(net, f"读取 OPF 结果错误: {type(e).__name__}: {e}")
         return False, net.error_msg
 
+    net.result_kind = "opf"
+    net.warnings = _collect_warnings(net)
     net.converged = True
     return True, ""
 
@@ -735,13 +866,18 @@ def run_short_circuit(net: Network, case: str = "max") -> Tuple[bool, str]:
         pnet, id_maps = build_pandapower(net)
         # 短路计算自身要做一次潮流初始化
         pp.runpp(pnet, algorithm="nr", init="flat", numba=False)
-        # PV 发电机参与短路: 按典型参数补齐 gen 表的短路列
-        # (额定电压取母线电压, 额定容量按 cosφ=0.85 由 P 折算, 次暂态电抗 18%)
+        # PV 发电机参与短路: 用机组自身的次暂态参数(属性面板可改)。
+        # 旧版把 x''d=18%/r''d=1%/cosφ=0.85 写死, 与铭牌无关 ——
+        # 真实 x''d 在 12%~25% 波动, Ikss 会有 10%~30% 偏差, 而短路
+        # 计算恰恰是用来校验遮断容量的。额定容量优先取 OPF 出力上限。
         for pp_id, uid in id_maps["gen"].items():
             g = net.gens[uid]
             vn = net.buses[g.bus_uid].vn_kv
-            sn = max(abs(g.p_mw) / 0.85, 10.0)
-            xdss, rdss = 18.0, 1.0
+            cos_phi = min(max(float(getattr(g, "cos_phi", 0.85) or 0.85), 0.1), 1.0)
+            p_ref = abs(float(getattr(g, "max_p_mw", 0.0) or 0.0)) or abs(g.p_mw)
+            sn = max(p_ref / cos_phi, 10.0)
+            xdss = float(getattr(g, "xdss_percent", 18.0))
+            rdss = float(getattr(g, "rdss_percent", 1.0))
             base_z = vn * vn / sn
             pnet.gen.at[pp_id, "vn_kv"] = vn
             pnet.gen.at[pp_id, "sn_mva"] = sn
@@ -751,7 +887,7 @@ def run_short_circuit(net: Network, case: str = "max") -> Tuple[bool, str]:
             pnet.gen.at[pp_id, "rdss_ohm"] = rdss / 100.0 * base_z
             pnet.gen.at[pp_id, "xdss_pu"] = xdss / 100.0
             pnet.gen.at[pp_id, "rdss_pu"] = rdss / 100.0
-            pnet.gen.at[pp_id, "cos_phi"] = 0.85
+            pnet.gen.at[pp_id, "cos_phi"] = cos_phi
             pnet.gen.at[pp_id, "generator_type"] = "PV"
         calc_sc(pnet, case=case, ip=False, topology="auto", lv_tol_percent=10)
     except pp.LoadflowNotConverged as e:
@@ -766,9 +902,27 @@ def run_short_circuit(net: Network, case: str = "max") -> Tuple[bool, str]:
         for uid, pp_id in id_maps["bus"].items():
             if pp_id in res_sc.index:
                 net.bus_ikss_ka[uid] = float(res_sc.at[pp_id, "ikss_ka"])
+        # 回填短路前的运行电压/相角: calc_sc 内部已经算过潮流, 不回填的话
+        # 切到电压视图看到的是上一次 AC 的脏数据(或空白)。注意只回填母线,
+        # 不碰 line_*/trafo_*(短路结果与潮流结果互斥显示)。
+        res_bus = getattr(pnet, "res_bus", None)
+        if res_bus is not None and "vm_pu" in set(res_bus.columns):
+            for uid, pp_id in id_maps["bus"].items():
+                if pp_id not in res_bus.index:
+                    continue
+                vm = float(res_bus.at[pp_id, "vm_pu"])
+                if vm != vm:      # NaN: 孤立母线, 不写入
+                    continue
+                net.bus_voltage_pu[uid] = vm
+                net.bus_voltage_kv[uid] = vm * net.buses[uid].vn_kv
+                va = float(res_bus.at[pp_id, "va_degree"])
+                if va == va:
+                    net.bus_va_degree[uid] = va
     except Exception as e:
         _fail(net, f"读取短路结果错误: {type(e).__name__}: {e}")
         return False, net.error_msg
 
+    net.result_kind = "sc"
+    net.warnings = _collect_warnings(net)
     net.converged = True
     return True, ""

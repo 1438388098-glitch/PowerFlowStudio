@@ -12,15 +12,20 @@ import sys
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
-from PyQt5.QtWidgets import QApplication
+import theme  # noqa: E402
 
-from app import MainWindow, render_scene_png
+theme.enable_high_dpi()          # 必须在 QApplication 之前, 否则高分屏下截图偏小
+
+from PyQt5.QtWidgets import QApplication  # noqa: E402
+
+from app import MainWindow, render_scene_png  # noqa: E402
 
 
 def main():
-    QApplication.instance() or QApplication([])   # 初始化 Qt 必需
+    app = QApplication.instance() or QApplication([])   # 初始化 Qt 必需
+    theme.apply_theme(app)
     w = MainWindow()
-    w.resize(1280, 800)
+    w.resize(*theme.default_window_size())
     w._load_two_end_demo()
     # 不调用 show(): 隐藏状态下 grab/render 即可成像, 不会打扰桌面
     os.makedirs("docs", exist_ok=True)

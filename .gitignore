@@ -45,6 +45,8 @@ htmlcov/
 .tox/
 .nox/
 *.log
+# 多分辨率渲染核对的截图产物 (tools/render_multires.py)
+.ui_check/
 
 # 用户保存的拓扑文件
 topology.json
