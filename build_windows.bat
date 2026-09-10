@@ -61,7 +61,7 @@ echo.
 
 REM --- Sanity check the imports before packaging ---
 echo [4/5] Sanity-checking imports ...
-python -c "import PyQt5, pandapower, numpy; print('  PyQt5', PyQt5.QtCore.PYQT_VERSION_STR); print('  pandapower', pandapower.__version__); print('  numpy', numpy.__version__)"
+python -c "import PyQt5.QtCore, pandapower, numpy; print('  PyQt5', PyQt5.QtCore.PYQT_VERSION_STR); print('  pandapower', pandapower.__version__); print('  numpy', numpy.__version__)"
 if errorlevel 1 (
     echo [ERROR] Imports failed.
     pause
