@@ -7,6 +7,9 @@ results.py — 潮流结果展示与导出
 from __future__ import annotations
 
 import csv
+import math
+import os
+from typing import Optional
 
 from PyQt5.QtCore import Qt, pyqtSignal
 from PyQt5.QtWidgets import (
@@ -16,9 +19,30 @@ from PyQt5.QtWidgets import (
 
 from solver import Network
 
+import theme
 
-def _fmt(v, nd=3):
-    return f"{v:.{nd}f}" if isinstance(v, (int, float)) else "—"
+# 图表配色/字号(与 theme 无关的少量常量, 便于 pyqtgraph 单独取用)
+PLOT_BG = "w"
+PLOT_BAR_BRUSH = "#3c78c8"
+PLOT_LIMIT_PEN = "#c04040"
+
+
+def _bad(v) -> bool:
+    """None / NaN / inf / 非数值"""
+    if v is None:
+        return True
+    try:
+        f = float(v)
+    except (TypeError, ValueError):
+        return True
+    return math.isnan(f) or math.isinf(f)
+
+
+def _fmt(v, nd: int = 3) -> str:
+    """数值格式化: 空值/NaN/inf → '—'(不显示字面 'nan')"""
+    if _bad(v):
+        return "—"
+    return f"{float(v):.{nd}f}"
 
 
 class ResultsPanel(QWidget):
@@ -31,9 +55,11 @@ class ResultsPanel(QWidget):
         self._bus_row_uids = []
         self._branch_row_uids = []
         layout = QVBoxLayout(self)
-        layout.setContentsMargins(2, 2, 2, 2)
+        margins = int(4 * theme.ui_scale())
+        layout.setContentsMargins(margins, margins, margins, margins)
         self.loss_label = QLabel("")
-        self.loss_label.setStyleSheet("font-weight:bold;")
+        self.loss_label.setStyleSheet(
+            f"font-weight:bold; padding:{theme.px(2)} {theme.px(4)};")
         layout.addWidget(self.loss_label)
         self.tabs = QTabWidget()
         self.bus_table = QTableWidget()
@@ -41,7 +67,12 @@ class ResultsPanel(QWidget):
         for tbl in (self.bus_table, self.branch_table):
             tbl.setEditTriggers(QTableWidget.NoEditTriggers)
             tbl.horizontalHeader().setSectionResizeMode(QHeaderView.Stretch)
+            tbl.horizontalHeader().setHighlightSections(False)
             tbl.verticalHeader().setVisible(False)
+            # 表格加斑马纹: 118 行数值横向对读时不串行
+            tbl.setAlternatingRowColors(True)
+            tbl.setShowGrid(False)
+            tbl.setSelectionBehavior(QTableWidget.SelectRows)
         self.tabs.addTab(self.bus_table, "母线")
         self.tabs.addTab(self.branch_table, "支路")
         layout.addWidget(self.tabs)
@@ -55,14 +86,17 @@ class ResultsPanel(QWidget):
         self._pg = None
         try:
             import pyqtgraph as pg
+            pg.setConfigOptions(antialias=True)
             self._pg = pg
             self.plot = pg.PlotWidget()
-            self.plot.setBackground("w")
+            self.plot.setBackground(PLOT_BG)
             self.plot.showGrid(y=True, alpha=0.3)
+            self.plot.setLabel("left", "V", units="pu")
             self.tabs.addTab(self.plot, "电压图")
             self.plot_va = pg.PlotWidget()
-            self.plot_va.setBackground("w")
+            self.plot_va.setBackground(PLOT_BG)
             self.plot_va.showGrid(y=True, alpha=0.3)
+            self.plot_va.setLabel("left", "相角", units="°")
             self.tabs.addTab(self.plot_va, "相角图")
             self._has_pg = True
         except Exception:
@@ -124,21 +158,28 @@ class ResultsPanel(QWidget):
         self._fill_branch_table(net)
 
     def _fill_bus_table(self, net: Network, rows: list) -> None:
-        self.bus_table.clear()
-        self.bus_table.setColumnCount(4)
-        self.bus_table.setHorizontalHeaderLabels(["母线", "V (pu)", "V (kV)", "相角 (°)"])
-        self.bus_table.setRowCount(len(rows))
-        self._bus_row_uids = []
-        for i, (uid, name, v, kv, a) in enumerate(rows):
-            for j, val in enumerate((name, _fmt(v, 4), _fmt(kv, 2), _fmt(a))):
-                item = QTableWidgetItem(str(val))
-                if j == 1:
-                    bg = self._v_cell_color(v)
-                    if bg is not None:
-                        item.setBackground(bg)
-                self.bus_table.setItem(i, j, item)
-            # 行直接携带 uid: 画布允许重名, 按名称反查会点错元件
-            self._bus_row_uids.append(uid)
+        # setUpdatesEnabled(False) 包住整段重建: 以前每个 setItem 都触发一次
+        # 重绘, 118 节点 × 4 列 = 472 次重排, 每次求解都肉眼可见地卡一下。
+        self.bus_table.setUpdatesEnabled(False)
+        try:
+            self.bus_table.clear()
+            self.bus_table.setColumnCount(4)
+            self.bus_table.setHorizontalHeaderLabels(
+                ["母线", "V (pu)", "V (kV)", "相角 (°)"])
+            self.bus_table.setRowCount(len(rows))
+            self._bus_row_uids = []
+            for i, (uid, name, v, kv, a) in enumerate(rows):
+                for j, val in enumerate((name, _fmt(v, 4), _fmt(kv, 2), _fmt(a))):
+                    item = QTableWidgetItem(str(val))
+                    if j == 1:
+                        bg = self._v_cell_color(v)
+                        if bg is not None:
+                            item.setBackground(bg)
+                    self.bus_table.setItem(i, j, item)
+                # 行直接携带 uid: 画布允许重名, 按名称反查会点错元件
+                self._bus_row_uids.append(uid)
+        finally:
+            self.bus_table.setUpdatesEnabled(True)
 
     def _fill_branch_table(self, net: Network) -> None:
         brows = []
@@ -159,24 +200,28 @@ class ResultsPanel(QWidget):
                           net.shunt_p_mw.get(uid),
                           net.shunt_q_mvar.get(uid), None))
         brows.sort(key=lambda r: r[2])
-        self.branch_table.clear()
-        self.branch_table.setColumnCount(5)
-        self.branch_table.setHorizontalHeaderLabels(
-            ["类型", "名称", "P (MW)", "Q (Mvar)", "负载率 (%)"])
-        self.branch_table.setRowCount(len(brows))
-        self._branch_row_uids = []
-        for i, (kind, uid, name, p, q, loading) in enumerate(brows):
-            vals = (kind, name, _fmt(p, 2), _fmt(q, 2),
-                    _fmt(loading, 1) if loading is not None else "—")
-            for j, val in enumerate(vals):
-                item = QTableWidgetItem(str(val))
-                if j == 4:
-                    bg = self._loading_cell_color(loading)
-                    if bg is not None:
-                        item.setBackground(bg)
-                self.branch_table.setItem(i, j, item)
-            # 行直接携带 uid: 画布允许重名, 按名称反查会点错元件
-            self._branch_row_uids.append(uid)
+        self.branch_table.setUpdatesEnabled(False)
+        try:
+            self.branch_table.clear()
+            self.branch_table.setColumnCount(5)
+            self.branch_table.setHorizontalHeaderLabels(
+                ["类型", "名称", "P (MW)", "Q (Mvar)", "负载率 (%)"])
+            self.branch_table.setRowCount(len(brows))
+            self._branch_row_uids = []
+            for i, (kind, uid, name, p, q, loading) in enumerate(brows):
+                vals = (kind, name, _fmt(p, 2), _fmt(q, 2),
+                        _fmt(loading, 1) if loading is not None else "—")
+                for j, val in enumerate(vals):
+                    item = QTableWidgetItem(str(val))
+                    if j == 4:
+                        bg = self._loading_cell_color(loading)
+                        if bg is not None:
+                            item.setBackground(bg)
+                    self.branch_table.setItem(i, j, item)
+                # 行直接携带 uid: 画布允许重名, 按名称反查会点错元件
+                self._branch_row_uids.append(uid)
+        finally:
+            self.branch_table.setUpdatesEnabled(True)
 
     # ---- 图表 ----
     def _bar_plot(self, plot, names: list, vals: list, limits: tuple = ()) -> None:
@@ -184,11 +229,11 @@ class ResultsPanel(QWidget):
         pg = self._pg
         plot.clear()
         for y in limits:
-            plot.addLine(y=y, pen=pg.mkPen("#c04040", style=Qt.DashLine))
+            plot.addLine(y=y, pen=pg.mkPen(PLOT_LIMIT_PEN, style=Qt.DashLine))
         if not vals:
             return
         bar = pg.BarGraphItem(x=list(range(len(vals))), height=vals,
-                              width=0.6, brush="#3c78c8")
+                              width=0.6, brush=PLOT_BAR_BRUSH)
         plot.addItem(bar)
         plot.getAxis("bottom").setTicks([list(enumerate(names))])
         lo = min([0.0] + vals)
@@ -249,6 +294,12 @@ def export_results_csv(net: Network, base_path: str) -> dict:
             w.writerow(["阻抗", im.name,
                         _fmt(net.impedance_p_from_mw.get(uid), 2),
                         _fmt(net.impedance_q_from_mvar.get(uid), 2), "—"])
+        # 并联电容/电抗以前漏在支路表之外 —— 界面上有这一行, 导出的 CSV 里
+        # 却没有, 拿去做报告就对不上账
+        for uid, sh in net.shunts.items():
+            w.writerow(["电容/电抗", sh.name,
+                        _fmt(net.shunt_p_mw.get(uid), 2),
+                        _fmt(net.shunt_q_mvar.get(uid), 2), "—"])
     with open(genload_csv, "w", newline="", encoding="utf-8-sig") as f:
         w = csv.writer(f)
         w.writerow(["类型", "名称", "挂接母线", "P设定(MW)", "V设定(pu)", "P实际(MW)", "Q实际(Mvar)"])
@@ -302,6 +353,3 @@ def render_scene_svg(scene, path: str) -> bool:
                  source=rect)
     painter.end()
     return os.path.exists(path)
-
-
-import os  # noqa: E402  (置于文件尾供 render_scene_svg 使用)

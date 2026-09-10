@@ -1,6 +1,10 @@
 name: tests
 
-on: [push, pull_request]
+on:
+  push:
+  pull_request:
+  # 打包冒烟只在打 tag 或手动触发时跑, 所以需要手动入口
+  workflow_dispatch:
 
 jobs:
   pytest:
@@ -22,8 +26,101 @@ jobs:
           python -m pip install --upgrade pip
           pip install -r requirements-dev.txt
       - name: Byte-compile all modules
-        run: python -m compileall -q app.py canvas.py palette.py properties.py solver.py defaults.py results.py undocmds.py ieee_cases.py
+        run: python -m compileall -q app.py canvas.py palette.py properties.py solver.py defaults.py results.py undocmds.py ieee_cases.py topo_io.py ux.py theme.py
       - name: Run tests with coverage
         env:
           QT_QPA_PLATFORM: offscreen
         run: python -m pytest tests -q --cov=. --cov-report=term
+
+  # ---------------------------------------------------------------
+  # 打包冒烟: 真正用 PyInstaller 打出 exe 并启动一次
+  #
+  # 为什么单独一个 job 且不挂在常规 push 上:
+  #   pandapower + numpy + pandas + PyQt5 全量打包一次要 3-6 分钟,
+  #   放进每次 push 的 CI 会明显拖慢反馈。这里只在打 tag 或手动
+  #   workflow_dispatch 时跑。
+  # 为什么必须有:
+  #   单元测试跑的是源代码, 而用户拿到的是 exe。PyInstaller 漏掉
+  #   动态导入(pandapower 的 std_types / 数据文件)时, 测试全绿但
+  #   双击 exe 直接闪退 —— 这类问题只有真打包一次才暴露。
+  # ---------------------------------------------------------------
+  package-smoke:
+    if: github.event_name == 'workflow_dispatch' || startsWith(github.ref, 'refs/tags/')
+    runs-on: windows-latest
+    timeout-minutes: 40
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements-dev.txt
+
+      - name: Byte-compile all modules
+        run: python -m compileall -q app.py canvas.py palette.py properties.py solver.py defaults.py results.py undocmds.py ieee_cases.py topo_io.py ux.py theme.py
+
+      - name: Build single-file exe
+        # 与 build_windows.bat 保持同一组参数, 避免"本地能打包、CI 不能"
+        run: pyinstaller --onefile --windowed --name PowerFlowStudio --noconfirm app.py
+
+      - name: Verify artifact
+        shell: pwsh
+        run: |
+          $exe = "dist/PowerFlowStudio.exe"
+          if (-not (Test-Path $exe)) { throw "打包未产出 $exe" }
+          $mb = (Get-Item $exe).Length / 1MB
+          Write-Host ("exe 大小: {0:N1} MB" -f $mb)
+          # 本地实测 (pandapower 3.5.4 + numpy 2.4.6 + PyQt5 5.15.11) 约 101 MB。
+          # 阈值取 60 MB: 漏收 pandas/scipy 这类大依赖会掉到 60 以下,
+          # 而正常波动不会。太靠近实测值容易误报。
+          if ($mb -lt 60) { throw "exe 只有 $mb MB, 依赖疑似未被打包进去" }
+
+      - name: Smoke-run the packaged exe
+        shell: pwsh
+        env:
+          POWERFLOW_NO_AUTOSHOW: "1"
+        run: |
+          $exe = Resolve-Path "dist/PowerFlowStudio.exe"
+          $ok = $false
+          # 先试 offscreen(CI 无显示会话也能跑), 不行再退回默认平台 ——
+          # 有些 runner 上 offscreen 插件未随包收集, 这不该算 exe 的错
+          foreach ($plat in @("offscreen", "")) {
+            if ($plat) { $env:QT_QPA_PLATFORM = $plat }
+            else { Remove-Item Env:\QT_QPA_PLATFORM -ErrorAction SilentlyContinue }
+            $p = Start-Process -FilePath $exe -PassThru
+            # onefile 首次运行要解包到临时目录, 给足启动时间
+            Start-Sleep -Seconds 25
+            if (-not $p.HasExited) {
+              Write-Host "启动正常 (QT_QPA_PLATFORM='$plat') —— exe 存活 25s"
+              Stop-Process -Id $p.Id -Force
+              $ok = $true
+              break
+            }
+            Write-Host "平台 '$plat' 下提前退出(退出码 $($p.ExitCode)), 换下一种平台再试"
+          }
+          if (-not $ok) {
+            throw "打包后的 exe 在 offscreen 与默认平台下都无法存活 —— 通常是 PyInstaller 漏收动态导入或平台插件"
+          }
+
+      - name: Upload PyInstaller warnings
+        # warn 文件列出所有"没找到但被引用的模块", 打包出问题时它是最快的线索
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: pyinstaller-warn
+          path: build/PowerFlowStudio/warn-PowerFlowStudio.txt
+          if-no-files-found: ignore
+          retention-days: 14
+
+      - name: Upload exe on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: powerflowstudio-exe-failed-run
+          path: dist/*.exe
+          if-no-files-found: ignore
+          retention-days: 7

@@ -1,7 +1,7 @@
 """
 ux.py — 编辑效率增强件 (二期拓展)
 
-- SearchDialog: 元件搜索定位 (Ctrl+F)
+- SearchDialog: 元件 + 支路搜索定位 (Ctrl+F)
 - MiniMapView + make_minimap_dock: 小地图 (共享 scene 的缩略视图)
 """
 from __future__ import annotations
@@ -15,17 +15,24 @@ from PyQt5.QtWidgets import (
     QGraphicsView, QDockWidget, QWidget, QVBoxLayout as QVBox
 )
 
+import theme
 from canvas import kind_of
 
 
 class SearchDialog(QDialog):
-    """元件搜索: 按名称/类型过滤, 双击或回车定位选中"""
+    """元件搜索: 按名称/类型过滤, 双击或回车定位选中。
+
+    搜索源同时覆盖元件与支路连线 —— 以前只遍历 ``_comp_by_uid``,
+    线路没有独立图形项, 于是"搜 L1 线路"永远搜不到。
+    """
     item_selected = pyqtSignal(str)   # uid
 
     def __init__(self, scene, parent=None):
         super().__init__(parent)
-        self.setWindowTitle("搜索元件 (Ctrl+F)")
-        self.resize(260, 360)
+        s = theme.ui_scale()
+        self.setWindowTitle("搜索元件 / 支路 (Ctrl+F)")
+        self.resize(int(300 * s), int(420 * s))
+        self.setMinimumSize(int(240 * s), int(240 * s))
         self._scene = scene
         layout = QVBoxLayout(self)
         self.edit = QLineEdit()
@@ -40,13 +47,41 @@ class SearchDialog(QDialog):
 
     def _populate(self):
         self.listw.clear()
+        net = getattr(self._scene, "network", None)
+        seen = set()
         for uid, item in self._scene._comp_by_uid.items():
             kind = kind_of(item)
             name = getattr(item.model, "name", "?")
             li = QListWidgetItem(f"[{kind}] {name}")
             li.setData(Qt.UserRole, uid)
             self.listw.addItem(li)
+            seen.add(uid)
+        # 支路连线(线路/变压器/阻抗): 名称取自 network, 画布上它们是连线
+        for c in list(getattr(self._scene, "_connections", [])):
+            uid = getattr(c, "uid", "") or ""
+            if not uid or uid in seen:
+                continue
+            name = self._branch_name(net, c.kind, uid)
+            li = QListWidgetItem(f"[{c.kind}] {name}")
+            li.setData(Qt.UserRole, uid)
+            self.listw.addItem(li)
+            seen.add(uid)
         self._filter(self.edit.text())
+
+    @staticmethod
+    def _branch_name(net, kind: str, uid: str) -> str:
+        if net is None:
+            return uid
+        try:
+            if kind == "Line":
+                return net.lines[uid].name
+            if kind == "Trafo":
+                return net.trafos[uid].name
+            if kind == "Impedance":
+                return net.impedances[uid].name
+        except (KeyError, AttributeError):
+            pass
+        return uid
 
     def _filter(self, text):
         text = (text or "").strip().lower()
@@ -134,6 +169,10 @@ def make_minimap_dock(scene, main_view, parent) -> QDockWidget:
     box = QVBox(inner)
     box.setContentsMargins(0, 0, 0, 0)
     view = MiniMapView(scene, main_view)
+    # 给一个随界面倍数缩放的最小尺寸, 否则 4K 上小地图会被压成一条缝
+    s = theme.ui_scale()
+    view.setMinimumSize(int(200 * s), int(140 * s))
+    dock.setMinimumWidth(int(210 * s))
     box.addWidget(view)
     dock.setWidget(inner)
     dock._minimap_view = view   # 供外部定时刷新

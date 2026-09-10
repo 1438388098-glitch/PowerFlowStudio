@@ -12,6 +12,7 @@ from typing import get_type_hints
 from solver import (
     Network, BusNode, GenUnit, LoadUnit,
     LineBranch, TrafoBranch, ImpedanceBranch, ShuntUnit,
+    BUS_REF_SPEC,
 )
 
 
@@ -24,9 +25,9 @@ _TOPO_SPEC = [
     ("impedances", ImpedanceBranch), ("shunts", ShuntUnit),
 ]
 
-# 不做数值校验的字段: 标识/名称/引用
+# 不做数值校验的字段: 标识/名称/引用/枚举
 _NON_NUMERIC = {"uid", "name", "bus_uid", "from_bus", "to_bus",
-                "hv_bus", "lv_bus", "is_slack", "gen_mode"}
+                "hv_bus", "lv_bus", "is_slack", "gen_mode", "vector_group"}
 
 
 def _check_numeric_fields(cls, kwargs, what: str) -> None:
@@ -45,9 +46,16 @@ def _check_numeric_fields(cls, kwargs, what: str) -> None:
                 raise ValueError(
                     f"{what} 字段 '{key}' 必须是有限数字, 实际为 {val!r}")
         elif typ is int:
-            if isinstance(val, bool) or not isinstance(val, int):
+            # 放宽: JSON 里 "0.0" / 0.0 这种写法应可接受 ——
+            # 外部工具(或 json 往返)很容易把整数写成浮点,
+            # 以前会误伤, 现在只要求"能安全转成 int"并顺手转掉。
+            if isinstance(val, bool) or not isinstance(val, (int, float)) \
+                    or not math.isfinite(val) \
+                    or float(val) != int(val):
                 raise ValueError(
                     f"{what} 字段 '{key}' 必须是整数, 实际为 {val!r}")
+            if not isinstance(val, int):
+                kwargs[key] = int(val)
 
 
 def parse_topology_json(data) -> Network:
@@ -77,26 +85,27 @@ def parse_topology_json(data) -> Network:
                 obj = cls(**kwargs)
             except TypeError as e:
                 raise ValueError(f"{what} 字段无效: {e}")
-            getattr(net, key)[obj.uid] = obj
+            container = getattr(net, key)
+            if obj.uid in container:
+                # 同一数组里 uid 重复: 以前是静默覆盖, 用户拿到的是
+                # "少了几个元件却看起来正常"的残缺模型 —— 必须报错。
+                raise ValueError(
+                    f"'{key}' 里存在重复的 uid: {obj.uid!r} "
+                    f"(条目 {obj.name!r}), 每个元件 uid 必须唯一")
+            container[obj.uid] = obj
     bus_uids = set(net.buses)
 
-    def _check_ref(ref, what, name):
-        if ref not in bus_uids:
-            raise ValueError(f"{what} '{name}' 引用了不存在的母线: {ref!r}")
-
-    for g in net.gens.values():
-        _check_ref(g.bus_uid, "发电机", g.name)
-    for ld in net.loads.values():
-        _check_ref(ld.bus_uid, "负荷", ld.name)
-    for ln in net.lines.values():
-        _check_ref(ln.from_bus, "线路", ln.name)
-        _check_ref(ln.to_bus, "线路", ln.name)
-    for tr in net.trafos.values():
-        _check_ref(tr.hv_bus, "变压器", tr.name)
-        _check_ref(tr.lv_bus, "变压器", tr.name)
-    for im in net.impedances.values():
-        _check_ref(im.from_bus, "阻抗", im.name)
-        _check_ref(im.to_bus, "阻抗", im.name)
+    # 引用校验由 solver.BUS_REF_SPEC 驱动: 元件类型 -> 引用母线的字段。
+    # 以前这里手写了 gens/loads/lines/trafos/impedances 五类, 唯独漏了
+    # shunts —— 悬空 shunt 会一路穿透到画布重建时 KeyError 崩溃(P0-1)。
+    for key, label, fields in BUS_REF_SPEC:
+        single = len(fields) == 1
+        for obj in getattr(net, key).values():
+            for fname in fields:
+                ref = getattr(obj, fname, "")
+                if ref not in bus_uids:
+                    where = "挂接的母线" if single else "的端点母线"
+                    raise ValueError(f"{label} '{obj.name}' {where}不存在: {ref!r}")
     return net
 
 

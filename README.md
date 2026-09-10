@@ -33,6 +33,38 @@
 - **标准算例**: 菜单一键加载 IEEE 14 / 30 / 39 / 57 / 118 母线测试系统
 - **拓扑保存/加载**: 整张电网保存为 JSON(原子写), 载入带完整校验
 - **示例一键加载**: 3 母线测试网 / 5 母线两端供电
+- **高分屏 / 分辨率自适应**: 4K(含 125%/150%/175% 非整数缩放)到 1366×768 都能正常显示;
+  窗口默认铺满可用区域且不超出屏幕, 三栏布局按当前分辨率重算, 字号与内边距同源缩放;
+  存档里的旧窗口/分栏几何会先校验再恢复(详见 `theme.py`)
+
+## 分辨率与显示说明
+
+界面外观集中在 `theme.py`:
+
+- `enable_high_dpi()` 在 `QApplication` **之前**打开 Qt 高分屏缩放, 并把缩放策略设为
+  `PassThrough`, 让 4K@150% 这类非整数倍率按真实比例渲染, 而不是被四舍五入。
+- `ui_scale()` 给出全局倍数: 系统已缩放(devicePixelRatio>1)时返回 1.0, 交给 Qt 自己缩放,
+  避免"双重放大"; 系统未缩放但物理 DPI 很高时按 DPI 比例放大字号。
+- `default_window_size()` / `minimum_window_size()` / `clamp_to_screen()` /
+  `splitter_sizes()` 都按当前屏幕可用区域计算, 换显示器不会被顶到屏幕外。
+- 调试或特殊显示器可用环境变量强制指定倍数:
+
+```bash
+POWERFLOW_UI_SCALE=1.25 python app.py     # Linux/macOS/WSL
+set POWERFLOW_UI_SCALE=1.25 && python app.py   # Windows cmd
+```
+
+`帮助 → 系统信息` 会显示当前屏幕尺寸、devicePixelRatio、逻辑 DPI 与实际生效的界面倍数,
+反馈显示问题时可以直接贴出来。改过布局后要做视觉核对, 可运行:
+
+```bash
+python tools/render_multires.py                       # 当前倍数
+POWERFLOW_UI_SCALE=1.5 python tools/render_multires.py # 模拟 150% 缩放
+```
+
+它会在 1366×768 / 1920×1080 / 2560×1440 / 3840×2160 四种尺寸下渲染主窗口到
+`.ui_check/`, 便于对照是否有截断、重叠或面板被挤成一条。`tools/render_screenshot.py`
+则用于重新生成 `docs/` 下的 README 截图。
 
 ## 安装
 
@@ -68,7 +100,37 @@ pip install -r requirements-dev.txt
 python -m pytest tests -q
 ```
 
-`solver` 层 17 个单元用例 + GUI offscreen 冒烟测试, 不需要显示器。
+`solver` 层单元用例 + GUI offscreen 冒烟测试共 151 个, 不需要显示器。
+测试覆盖: 拓扑/潮流/OPF/短路/N-1、存档往返与畸形 JSON、元件与连线生命周期、
+撤销重做、属性面板、主题与分辨率适配。
+
+CI 分两个 job (`.github/workflows/tests.yml`):
+
+- `pytest` —— 每次 push / PR 在 Ubuntu + Windows 双平台跑, 含 `compileall` 全模块字节码检查
+- `package-smoke` —— **仅在打 tag 或手动触发时**跑: 用 PyInstaller 真打一次单文件 exe,
+  校验体积下限并**实际启动进程存活 25 秒**。单元测试跑的是源码, 用户拿到的是 exe,
+  漏收动态导入这类问题只有真打包才暴露, 所以放进 CI 而不是靠手工发版时才发现。
+
+## 文件结构
+
+```
+PowerFlowStudio/
+├── app.py          # 主入口, 工具栏/菜单/快捷键, 后台计算线程
+├── canvas.py       # QGraphicsView 画布, 元件与连线
+├── palette.py      # 左侧元件库面板
+├── properties.py   # 右侧属性编辑面板(滚动区 + 范围校验)
+├── results.py      # 结果 dock: 母线/支路表, 电压与相角图, CSV/SVG 导出
+├── ux.py           # 小地图 / 搜索定位 / 对齐分布
+├── solver.py       # 拓扑 ↔ pandapower 转换 + 潮流/OPF/短路/N-1
+├── topo_io.py      # 拓扑 JSON 存取与校验(原子写)
+├── ieee_cases.py   # pandapower 标准算例反向转换
+├── theme.py        # 外观/高分屏/分辨率适配/窗体尺寸计算
+├── defaults.py     # 默认参数与字段范围(单一事实来源)
+├── undocmds.py     # 快照式撤销命令
+├── tools/          # 截图与辅助脚本
+├── tests/          # pytest 单元 + GUI offscreen 冒烟测试
+└── README.md
+```
 
 ## 打包成 exe
 
@@ -105,19 +167,6 @@ pyinstaller --onefile --windowed --name PowerFlowStudio app.py
 - Windows: 直接双击 `dist\PowerFlowStudio.exe` 运行
 - Linux: `pyinstaller --onefile --windowed app.py`, 产物 `dist/PowerFlowStudio`(ELF); 运行需 `sudo apt install libxcb-xinerama0 libxkbcommon-x11-0`
 
-## 文件结构
-
-```
-PowerFlowStudio/
-├── app.py          # 主入口, 工具栏/菜单/快捷键
-├── canvas.py       # QGraphicsView 画布, 元件与连线
-├── palette.py      # 左侧元件库面板
-├── properties.py   # 右侧属性编辑面板
-├── solver.py       # 拓扑 ↔ pandapower 转换 + 潮流计算
-├── tests/          # pytest 单元 + GUI offscreen 冒烟测试
-└── README.md
-```
-
 ## 键盘快捷键
 
 - `Ctrl+R`: 运行潮流
@@ -127,21 +176,22 @@ PowerFlowStudio/
 - `Ctrl+N`: 新建 (带未保存确认)
 - `Ctrl+S`: 保存
 - `Ctrl+0`: 适配视图
+- `Ctrl+F`: 搜索元件并定位
 - `Delete` / `Backspace`: 删除选中元件或连线
 - `ESC`: 取消正在拖的连线 / 取消选中
 
 ## 当前限制
 
-- 不支持 OPF / 短路 / 时域仿真(只做稳态潮流, DC 模式仅算有功/相角)
+- 只做稳态计算, 不含时域/机电暂态仿真; DC 模式仅算有功与相角
 - 多台发电机勾选平衡节点时只有第一台生效, 其余按 PV 节点处理
 - 变压器两端必须接到两个不同母线(创建时会自动避让)
-- 撤销不覆盖"拖动位置"(变压器/阻抗位置本就不存档)
+- 短路计算的 PV 机组参数(x''d / r''d / cosφ)是经验估值, 不是铭牌数据
 - 保存 JSON 时不含计算结果(只存拓扑)
 
 ## 扩展方向
 
-- 发电机 PV/PQ 节点类型自由切换
 - 内嵌时域仿真接口
-- OPF 最优潮流 (pandapower 自带 runopp)
-- 复制粘贴 / 多选批量编辑
+- 三相不平衡潮流 / 连续潮流
+- 拓扑层与视图层解耦, 求解器抽 Backend 接口
+- 多选批量编辑
 - DC 潮流模式下发电机 P 分配策略(当前 slack 吸收全部网损)
