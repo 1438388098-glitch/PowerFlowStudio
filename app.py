@@ -1672,8 +1672,10 @@ def main():
             "Unhandled exception",
             exc_info=(exc_type, exc_value, exc_tb))
         # Also print to stderr so the console window shows it.
-        sys.stderr.write("UNHANDLED EXCEPTION (also logged):\n")
-        traceback.print_exception(exc_type, exc_value, exc_tb)
+        # pythonw 启动时 sys.stderr 为 None, 直接写会二次崩
+        if sys.stderr is not None:
+            sys.stderr.write("UNHANDLED EXCEPTION (also logged):\n")
+            traceback.print_exception(exc_type, exc_value, exc_tb)
     sys.excepthook = _excepthook
 
     # 高分屏支持必须在 QApplication 实例化**之前**打开, 否则在 4K 屏上
