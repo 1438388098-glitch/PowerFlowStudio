@@ -74,7 +74,7 @@ class MiniMapView(QGraphicsView):
         self.setRenderHint(QPainter.Antialiasing)
         self.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
         self.setVerticalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
-        self.indicator = None   # 显示主视图可视范围的虚线框
+        self._indicator_poly = None   # 主视图可视范围, drawForeground 叠加绘制
         self.refresh()
 
     def refresh(self):
@@ -88,18 +88,26 @@ class MiniMapView(QGraphicsView):
             content = QRectF(0, 0, 800, 600)
         self.setSceneRect(content)
         self.fitInView(content, Qt.KeepAspectRatio)
-        # 指示框
-        if self.indicator is not None:
-            sc.removeItem(self.indicator)
-            self.indicator = None
+        # 指示框存为多边形, 在本视图 drawForeground 叠加绘制:
+        # 不进共享场景 → 导出 PNG/SVG 与适配视图不受红框污染,
+        # 也不必每 600ms 从场景增删图形项
         if self._main is not None and self._main.scene() is sc:
             visible = self._main.mapToScene(self._main.viewport().rect()).boundingRect()
-            from PyQt5.QtCore import QPointF
             from PyQt5.QtGui import QPolygonF
-            poly = QPolygonF(visible)
-            self.indicator = sc.addPath(_poly_to_path(poly),
-                                        QPen(Qt.red, 0, Qt.DashLine))
-            self.indicator.setZValue(50)
+            self._indicator_poly = QPolygonF(visible)
+        else:
+            self._indicator_poly = None
+        self.viewport().update()
+
+    def drawForeground(self, painter, rect):
+        from PyQt5.QtGui import QPainter
+        poly = self._indicator_poly
+        if poly is not None and poly.count():
+            painter.save()
+            painter.setRenderHint(QPainter.Antialiasing, True)
+            painter.setPen(QPen(Qt.red, 0, Qt.DashLine))
+            painter.drawPath(_poly_to_path(poly))
+            painter.restore()
 
     def mousePressEvent(self, event):
         if self._main is not None:

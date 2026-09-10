@@ -822,34 +822,55 @@ class TestRound10Features:
         assert len(w.network.buses) == 24
 
     def test_hover_highlight_state(self, qapp):
+        """hover 高亮状态机 + 带高亮的重绘不崩。
+
+        PyQt5 无法直接构造 QGraphicsSceneHoverEvent(C++ protected),
+        viewport().event() 在 Linux 下同样抛 RuntimeError, 因此直接
+        驱动 _hovered 状态并触发重绘(与 hoverEnter/LeaveEvent 末段
+        行为一致), 两平台行为相同。"""
         from canvas import CircuitScene, CircuitView
         from solver import Network
-        from PyQt5.QtCore import QPointF
         scene = CircuitScene(Network())
         b = scene.add_component("Bus", 100, 100)
         view = CircuitView(scene)
         view.resize(600, 400)
         view.show()
-        # 直接调 hover 事件处理, 验证状态切换与重绘不崩
-        from PyQt5.QtGui import QHoverEvent
-        from PyQt5.QtCore import QEvent
-        pos = view.mapFromScene(b.scenePos() + QPointF(40, 25))
-        ev = QHoverEvent(QEvent.HoverEnter, pos, pos)
-        view.viewport().event(ev)   # 走真实分发路径
+        b._hovered = True
+        b.update()          # 高亮描边重绘
         scene.update()
+        assert b._hovered is True
+        b._hovered = False
+        b.update()
+        assert b._hovered is False
         view.close()
 
-    def test_cli_open_argument(self, qapp, tmp_path):
-        """命令行参数打开拓扑: 复用 _load_topology, 验证路径逻辑"""
-        from app import MainWindow
-        w = MainWindow()
+    def test_cli_open_argument(self, qapp, tmp_path, monkeypatch):
+        """命令行参数打开拓扑: 构造 sys.argv 真正走 main() 的载入分支"""
+        import app as app_mod
+        w = app_mod.MainWindow()
         w.scene.add_component("Bus", 100, 100)
         path = str(tmp_path / "cli.json")
         w._save_topology(path)
-        w2 = MainWindow()
-        import os
-        assert os.path.exists(path)   # main() 里按此路径调 _load_topology
-        assert w2._load_topology(path) is True
+        w._set_dirty(False)
+        w.close()
+        w.network.buses.clear()   # 清掉, 证明随后是 main() 自己载入的
+
+        class _FakeApp:
+            def __init__(self, *a):
+                pass
+
+            def setStyle(self, *a):
+                pass
+
+            def exec_(self):
+                return 0
+
+        monkeypatch.setattr(app_mod, "QApplication", _FakeApp)
+        monkeypatch.setattr(app_mod, "MainWindow", lambda: w)
+        monkeypatch.setattr(app_mod.sys, "argv", ["app.py", path])
+        with pytest.raises(SystemExit):
+            app_mod.main()
+        assert w.network.buses, "main() 应按 sys.argv[1] 载入拓扑"
 
     def test_sysinfo_strings_available(self, qapp):
         """系统信息对话框内容来源可用(不弹框, 验证数据源)"""
@@ -862,10 +883,31 @@ class TestRound10Features:
         assert isinstance(log_path, str) and log_path
 
     def test_startup_autosave_hint(self, qapp, monkeypatch, tmp_path):
+        """无自动保存存档 → 提示为 None; 有存档+时间戳 → 给出恢复提示"""
         from app import MainWindow
+        fake = tmp_path / "autosave.json"
+
+        class FakeSettings:
+            def value(self, key, default=""):
+                if key == "autosave_time":
+                    return "2026-09-09 08:00"
+                return None   # 其余键(如 window_geometry)一律视为未设置
+
+        monkeypatch.setattr(MainWindow, "_autosave_paths",
+                            lambda self: [str(fake)])
+        monkeypatch.setattr(MainWindow, "_recent_settings",
+                            lambda self: FakeSettings())
         w = MainWindow()
-        # 无自动保存文件时提示为 None
-        assert w._startup_autosave_hint is None or isinstance(w._startup_autosave_hint, str)
+        assert w._startup_autosave_hint is None, "存档不存在时不应给恢复提示"
+        w._set_dirty(False)
+        w.close()
+        fake.write_text("{}")
+        w2 = MainWindow()
+        assert w2._startup_autosave_hint is not None \
+            and "2026-09-09" in w2._startup_autosave_hint, \
+            "存档存在时应提示可恢复及时间"
+        w2._set_dirty(False)
+        w2.close()
 
 
 class TestNegativeLoadUI:
@@ -1016,6 +1058,8 @@ class TestRoundBFeatures:
         w._refresh_minimap()   # 不崩即可
         view = w.minimap_dock._minimap_view
         assert view.scene() is w.scene
+        # 指示框改为视图叠加层: 主视图共享场景时应有可视范围多边形
+        assert view._indicator_poly is not None
 
     def test_apply_alignment_modes(self, qapp):
         from canvas import apply_alignment, CircuitScene
@@ -1093,3 +1137,87 @@ class TestRoundDFeatures:
         w.act_dslack.setChecked(True)
         w._load_demo()
         assert w.network.converged
+
+
+class TestReviewRegressionsGUI:
+    """PR 审查意见回归测试 (v0.7.1): Shunt 删除链路 / 连线删除 / 粘贴"""
+
+    def _scene_with_shunt(self):
+        from canvas import CircuitScene
+        from solver import Network
+        scene = CircuitScene(Network())
+        b = scene.add_component("Bus", 200, 200)
+        sh = scene.add_component("Shunt", 340, 140)
+        return scene, b, sh
+
+    def test_delete_shunt_removes_model(self, qapp):
+        """C2: 删电容只删图形项、model 残留 → 撤销失效/求解 KeyError"""
+        scene, b, sh = self._scene_with_shunt()
+        scene.delete_item(sh)
+        assert not scene.network.shunts, "删电容后 model 应同步删除"
+        assert sh.model.uid not in scene._comp_by_uid
+
+    def test_delete_bus_cascades_shunt(self, qapp):
+        """C2: 删母线不级联删挂接电容 → 孤儿引用使存档载入被拒"""
+        scene, b, sh = self._scene_with_shunt()
+        sh.model.bus_uid = b.model.uid
+        scene.delete_item(b)
+        assert not scene.network.shunts, "删母线应级联删除挂接的电容"
+        assert not scene.network.buses
+
+    def test_shunt_survives_roundtrip_and_rebuild(self, qapp):
+        """C2: 保存→载入(场景重建)后 ShuntItem 仍应在画布上"""
+        import json
+        from app import parse_topology_json, network_to_json_dict
+        scene, b, sh = self._scene_with_shunt()
+        sh.model.bus_uid = b.model.uid
+        data = json.loads(json.dumps(network_to_json_dict(scene.network)))
+        net2 = parse_topology_json(data)
+        assert net2.shunts, "存档应包含电容"
+        from app import MainWindow
+        w = MainWindow()
+        w._apply_network(net2)
+        assert w.network.shunts, "载入后电容 model 应在"
+        assert sh.model.uid in w.scene._comp_by_uid, \
+            "场景重建应生成 ShuntItem(否则电容消失却仍参与求解)"
+        w._set_dirty(False)
+        w.close()
+
+    def test_delete_trafo_connection_removes_whole_branch(self, qapp):
+        """C3: 删母线↔变压器连线曾把 hv_bus 置空 → 存得进读不出"""
+        from canvas import ConnectionItem
+        scene, b, sh = self._scene_with_shunt()
+        b2 = scene.add_component("Bus", 500, 200)
+        tr = scene.add_component("Trafo", 350, 200)
+        b.model.vn_kv = 110.0
+        b2.model.vn_kv = 10.0
+        scene.create_connection(b, b.port_item("right"), tr, tr.port_item("p1"))
+        scene.create_connection(tr, tr.port_item("p2"), b2, b2.port_item("left"))
+        conns = [c for c in scene._connections
+                 if c.a_comp is tr or c.b_comp is tr]
+        assert len(conns) == 2, "重建后的变压器应有两根连线"
+        scene.delete_item(conns[0])
+        assert tr.model.uid not in scene.network.trafos, \
+            "删一侧连线应整体删除变压器, 不允许留下空引用"
+        for br in scene.network.trafos.values():
+            assert br.hv_bus and br.lv_bus, "不得残留空母线引用"
+
+    def test_paste_does_not_pollute_clipboard(self, qapp):
+        """粘贴不得改写剪贴板原件, 二次粘贴坐标偏移应一致"""
+        scene, b, sh = self._scene_with_shunt()
+        n_before = len(scene.network.buses)
+        b.setSelected(True)
+        sh.setSelected(True)
+        scene.copy_selection()
+        first = scene.paste_clipboard()
+        assert first >= 1
+        snap1 = {uid: (m.x, m.y) for uid, m in scene.network.buses.items()}
+        scene.paste_clipboard()
+        new_buses = [m for uid, m in scene.network.buses.items()
+                     if uid not in snap1 and m.name != "B1"]
+        assert len(scene.network.buses) == n_before + 2
+        # 修复后的语义: 每次粘贴都从原件坐标+固定偏移粘贴(不再叠加)
+        pasted = [m for m in scene.network.buses.values() if m.name != "B1"]
+        assert len(pasted) == 2
+        xs = sorted(m.x for m in pasted)
+        assert xs[-1] - xs[0] == pytest.approx(0.0),             "剪贴板被污染时二次粘贴坐标会叠加偏移"

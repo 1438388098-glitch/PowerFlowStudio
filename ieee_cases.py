@@ -8,7 +8,7 @@ from __future__ import annotations
 
 from solver import (
     Network, BusNode, GenUnit, LoadUnit,
-    LineBranch, TrafoBranch, ImpedanceBranch,
+    LineBranch, TrafoBranch, ImpedanceBranch, ShuntUnit,
 )
 
 SUPPORTED_CASES = ("case14", "case24_ieee_rts", "case30", "case39",
@@ -16,9 +16,14 @@ SUPPORTED_CASES = ("case14", "case24_ieee_rts", "case30", "case39",
 
 
 def load_case(name: str) -> Network:
-    """加载标准算例并转成画布 Network。name 见 SUPPORTED_CASES。"""
+    """加载标准算例并转成画布 Network。name 见 SUPPORTED_CASES。
+
+    sgen → PQ 机组、shunt → 电容/电抗; 无法转换的元件类型按数量
+    发 warning(而非静默丢弃), 避免用户拿到残缺却"看起来正常"的模型。"""
     if name not in SUPPORTED_CASES:
         raise ValueError(f"不支持的算例: {name} (可选: {', '.join(SUPPORTED_CASES)})")
+    import warnings
+
     import pandapower.networks as ppn
     pnet = getattr(ppn, name)()
 
@@ -60,12 +65,27 @@ def load_case(name: str) -> Network:
             uid=uid, name=f"G{int(i) + 1}",
             bus_uid=bus_uid[int(row["bus"])],
             p_mw=_f(row, "p_mw", 0.0), vm_pu=_f(row, "vm_pu", 1.0))
+    # sgen → PQ 机组 (定功率注入, 不调电压), 保证 case24 等算例发电平衡
+    for i, row in pnet.sgen.iterrows():
+        uid = f"gs_gen{int(i)}"
+        net.gens[uid] = GenUnit(
+            uid=uid, name=f"SG{int(i) + 1}",
+            bus_uid=bus_uid[int(row["bus"])],
+            p_mw=_f(row, "p_mw", 0.0), gen_mode="PQ")
 
     # 负荷
     for i, row in pnet.load.iterrows():
         uid = f"l{int(i)}"
         net.loads[uid] = LoadUnit(
             uid=uid, name=f"Load{int(i) + 1}",
+            bus_uid=bus_uid[int(row["bus"])],
+            p_mw=_f(row, "p_mw"), q_mvar=_f(row, "q_mvar"))
+
+    # 并联电容/电抗 (符号约定与 pandapower 一致: q>0 电抗, q<0 电容)
+    for i, row in pnet.shunt.iterrows():
+        uid = f"sh{int(i)}"
+        net.shunts[uid] = ShuntUnit(
+            uid=uid, name=f"Shunt{int(i) + 1}",
             bus_uid=bus_uid[int(row["bus"])],
             p_mw=_f(row, "p_mw"), q_mvar=_f(row, "q_mvar"))
 
@@ -112,4 +132,17 @@ def load_case(name: str) -> Network:
             sn_mva=_f(row, "sn_mva", 100.0) or 100.0,
         )
 
+    # 其余无法表达的元件类型: 明确警告而不是静默丢弃
+    dropped = []
+    for tbl, label in (("storage", "储能"), ("svc", "SVC"), ("tcsc", "TCSC"),
+                       ("dcline", "直流线"), ("ward", "等值 Ward"),
+                       ("xward", "等值 XWard"), ("motor", "电动机"),
+                       ("asymmetric_load", "不对称负荷"),
+                       ("asymmetric_sgen", "不对称电源")):
+        cnt = len(getattr(pnet, tbl, []))
+        if cnt:
+            dropped.append(f"{label}×{cnt}")
+    if dropped:
+        warnings.warn(f"算例 {name} 含画布暂不支持的元件, 已跳过: "
+                      + ", ".join(dropped), stacklevel=2)
     return net

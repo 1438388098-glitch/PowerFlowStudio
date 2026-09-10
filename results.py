@@ -111,12 +111,12 @@ class ResultsPanel(QWidget):
                 f"{net.total_loss_q_mvar:.2f} Mvar ({pct:.2f}%)")
         else:
             self.loss_label.setText("")
-        rows = [(b.name,
+        rows = [(uid, b.name,
                  net.bus_voltage_pu.get(uid),
                  net.bus_voltage_kv.get(uid),
                  net.bus_va_degree.get(uid))
                 for uid, b in net.buses.items()]
-        rows.sort(key=lambda r: r[0])
+        rows.sort(key=lambda r: r[1])
         if self._has_pg:
             self._refresh_plot(rows)
             self._refresh_va_plot(rows)
@@ -129,7 +129,7 @@ class ResultsPanel(QWidget):
         self.bus_table.setHorizontalHeaderLabels(["母线", "V (pu)", "V (kV)", "相角 (°)"])
         self.bus_table.setRowCount(len(rows))
         self._bus_row_uids = []
-        for i, (name, v, kv, a) in enumerate(rows):
+        for i, (uid, name, v, kv, a) in enumerate(rows):
             for j, val in enumerate((name, _fmt(v, 4), _fmt(kv, 2), _fmt(a))):
                 item = QTableWidgetItem(str(val))
                 if j == 1:
@@ -137,35 +137,35 @@ class ResultsPanel(QWidget):
                     if bg is not None:
                         item.setBackground(bg)
                 self.bus_table.setItem(i, j, item)
-            uid = next((u for u, b in net.buses.items() if b.name == name), None)
-            self._bus_row_uids.append(uid or "")
+            # 行直接携带 uid: 画布允许重名, 按名称反查会点错元件
+            self._bus_row_uids.append(uid)
 
     def _fill_branch_table(self, net: Network) -> None:
         brows = []
         for uid, ln in net.lines.items():
-            brows.append(("线路", ln.name,
+            brows.append(("线路", uid, ln.name,
                           net.line_p_from_mw.get(uid), net.line_q_from_mvar.get(uid),
                           net.line_loading_percent.get(uid)))
         for uid, tr in net.trafos.items():
-            brows.append(("变压器", tr.name,
+            brows.append(("变压器", uid, tr.name,
                           net.trafo_p_hv_mw.get(uid), net.trafo_q_hv_mvar.get(uid),
                           net.trafo_loading_percent.get(uid)))
         for uid, im in net.impedances.items():
-            brows.append(("阻抗", im.name,
+            brows.append(("阻抗", uid, im.name,
                           net.impedance_p_from_mw.get(uid),
                           net.impedance_q_from_mvar.get(uid), None))
         for uid, sh in net.shunts.items():
-            brows.append(("电容/电抗", sh.name,
+            brows.append(("电容/电抗", uid, sh.name,
                           net.shunt_p_mw.get(uid),
                           net.shunt_q_mvar.get(uid), None))
-        brows.sort(key=lambda r: r[1])
+        brows.sort(key=lambda r: r[2])
         self.branch_table.clear()
         self.branch_table.setColumnCount(5)
         self.branch_table.setHorizontalHeaderLabels(
             ["类型", "名称", "P (MW)", "Q (Mvar)", "负载率 (%)"])
         self.branch_table.setRowCount(len(brows))
         self._branch_row_uids = []
-        for i, (kind, name, p, q, loading) in enumerate(brows):
+        for i, (kind, uid, name, p, q, loading) in enumerate(brows):
             vals = (kind, name, _fmt(p, 2), _fmt(q, 2),
                     _fmt(loading, 1) if loading is not None else "—")
             for j, val in enumerate(vals):
@@ -175,10 +175,8 @@ class ResultsPanel(QWidget):
                     if bg is not None:
                         item.setBackground(bg)
                 self.branch_table.setItem(i, j, item)
-            container = {"线路": net.lines, "变压器": net.trafos,
-                         "阻抗": net.impedances, "电容/电抗": net.shunts}[kind]
-            uid = next((u for u, b in container.items() if b.name == name), None)
-            self._branch_row_uids.append(uid or "")
+            # 行直接携带 uid: 画布允许重名, 按名称反查会点错元件
+            self._branch_row_uids.append(uid)
 
     # ---- 图表 ----
     def _bar_plot(self, plot, names: list, vals: list, limits: tuple = ()) -> None:
@@ -199,17 +197,18 @@ class ResultsPanel(QWidget):
         plot.setYRange(lo - pad, hi + pad)
 
     def _refresh_plot(self, rows: list) -> None:
-        vals = [r[1] for r in rows
-                if isinstance(r[1], (int, float)) and r[1] == r[1]]  # 剔除 NaN
-        names = [r[0] for r in rows
-                 if isinstance(r[1], (int, float)) and r[1] == r[1]]
+        # rows: (uid, name, v_pu, v_kv, va_degree)
+        vals = [r[2] for r in rows
+                if isinstance(r[2], (int, float)) and r[2] == r[2]]  # 剔除 NaN
+        names = [r[1] for r in rows
+                 if isinstance(r[2], (int, float)) and r[2] == r[2]]
         self._bar_plot(self.plot, names, vals, limits=(0.95, 1.05))
 
     def _refresh_va_plot(self, rows: list) -> None:
-        vals = [r[3] for r in rows
-                if isinstance(r[3], (int, float)) and r[3] == r[3]]
-        names = [r[0] for r in rows
-                 if isinstance(r[3], (int, float)) and r[3] == r[3]]
+        vals = [r[4] for r in rows
+                if isinstance(r[4], (int, float)) and r[4] == r[4]]
+        names = [r[1] for r in rows
+                 if isinstance(r[4], (int, float)) and r[4] == r[4]]
         self._bar_plot(self.plot_va, names, vals, limits=(0.0,))
 
 

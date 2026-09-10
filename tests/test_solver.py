@@ -539,3 +539,53 @@ class TestNMinus1Progress:
         report = n_minus_1_check(net, progress=lambda d, t: calls.append((d, t)))
         assert len(calls) == len(report) == 4   # 4 条线路
         assert calls[-1][1] == 4
+
+
+class TestReviewRegressions:
+    """PR 审查意见回归测试 (v0.7.1)"""
+
+    def test_pq_gen_short_circuit_max(self):
+        """C1: PQ 机组(sgen) + 短路 max 曾因缺 sn_mva/k 必然报错"""
+        from solver import GenUnit, run_short_circuit
+        net = build_3bus_network()
+        net.gens["g2"] = GenUnit(uid="g2", name="G2-PQ", bus_uid="b2",
+                                 p_mw=5.0, gen_mode="PQ")
+        ok, err = run_short_circuit(net, case="max")
+        assert ok, err
+        assert set(net.bus_ikss_ka) == {"b1", "b2", "b3"}
+
+    def test_n1_includes_impedance_and_dslack(self):
+        """N-1 应把串联阻抗纳入枚举, 并透传 distributed_slack"""
+        from solver import (ImpedanceBranch, GenUnit, n_minus_1_check)
+        net = build_3bus_network()
+        net.impedances["z1"] = ImpedanceBranch(
+            uid="z1", name="Z1", from_bus="b2", to_bus="b3")
+        report = n_minus_1_check(net, distributed_slack=True)
+        assert "_base_failed" not in report
+        assert "z1" in report, "串联阻抗开断应被校核"
+        assert len(report) == 3   # 2 线 + 1 阻抗
+
+    def test_validate_detects_dangling_shunt(self):
+        from solver import ShuntUnit, run_power_flow
+        net = build_3bus_network()
+        net.shunts["sh1"] = ShuntUnit(uid="sh1", name="SH1",
+                                      bus_uid="b_ghost")
+        ok, err = run_power_flow(net)
+        assert not ok
+        assert "SH1" in err and "不存在" in err
+
+    def test_topo_rejects_bad_numeric(self):
+        """载入校验: 数值字段必须为有限数字, 给出条目+字段名"""
+        from topo_io import parse_topology_json
+        data = {"buses": [{"uid": "b1", "name": "B1", "x": "abc", "y": 0,
+                           "vn_kv": 110.0}]}
+        with pytest.raises(ValueError, match="x"):
+            parse_topology_json(data)
+
+    def test_ieee_case24_keeps_sgen_and_shunt(self):
+        """C4: case24 的 sgen 与 shunt 不再被静默丢弃"""
+        from ieee_cases import load_case
+        net = load_case("case24_ieee_rts")
+        pq_gens = [g for g in net.gens.values() if g.gen_mode == "PQ"]
+        assert pq_gens, "case24 的 22 台 sgen 应转成 PQ 机组"
+        assert net.shunts, "case14/24 等算例的并联支路应被保留"

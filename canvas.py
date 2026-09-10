@@ -729,10 +729,15 @@ class CircuitView(QGraphicsView):
                 align_menu.addAction("纵向等间距", lambda: _do_align("dist_v"))
         if isinstance(item, BaseComponent):
             def _rename():
+                before = (win.snapshot_network()
+                          if hasattr(win, "snapshot_network") else None)
                 text, ok = QInputDialog.getText(
                     self, "重命名", "新名称:", text=item.model.name)
                 if ok and text.strip():
                     item.update_label(text.strip())
+                    if before is not None and hasattr(win, "push_move_undo"):
+                        win.push_move_undo(before, win.snapshot_network(),
+                                           label="重命名")
             act_rename = menu.addAction(f"重命名 {item.model.name}")
             act_rename.triggered.connect(_rename)
             act_del = menu.addAction("删除")
@@ -1082,7 +1087,8 @@ class CircuitScene(QGraphicsScene):
                       "Shunt": self.network.shunts}
         uid_map: Dict[str, str] = {}
         new_items: List[BaseComponent] = []
-        for kind, mdict in self._clipboard["components"]:
+        for kind, raw in self._clipboard["components"]:
+            mdict = dict(raw)   # 不改剪贴板原件, 否则二次粘贴坐标/名字会被污染
             container = containers[kind]
             item_cls = self._builders[kind][2]
             prefix = self._builders[kind][3]
@@ -1094,8 +1100,14 @@ class CircuitScene(QGraphicsScene):
             mdict["x"] = mdict.get("x", 0.0) + offset[0]
             mdict["y"] = mdict.get("y", 0.0) + offset[1]
             model = model_cls[kind](**mdict)
-            if kind in ("Gen", "Load"):
+            if kind in ("Gen", "Load", "Shunt"):
                 model.bus_uid = uid_map.get(model.bus_uid, model.bus_uid)
+            elif kind == "Trafo":
+                model.hv_bus = uid_map.get(model.hv_bus, model.hv_bus)
+                model.lv_bus = uid_map.get(model.lv_bus, model.lv_bus)
+            elif kind == "Impedance":
+                model.from_bus = uid_map.get(model.from_bus, model.from_bus)
+                model.to_bus = uid_map.get(model.to_bus, model.to_bus)
             container[new_uid] = model
             item = item_cls(model)
             item.setPos(model.x, model.y)
@@ -1150,6 +1162,10 @@ class CircuitScene(QGraphicsScene):
                     self._internal_links.pop(uid, None)
                 # 以该母线为端点的线路/变压器/阻抗: model 和图形项一起删
                 self._purge_branches_on_bus(uid)
+                # 挂在该母线上的电容/电抗同样级联删除(model+图形项), 防孤儿引用
+                for sh_uid in [u for u, sh in self.network.shunts.items()
+                               if sh.bus_uid == uid]:
+                    self._remove_component(sh_uid)
             elif kind == "Gen":
                 self.network.gens.pop(uid, None)
             elif kind == "Load":
@@ -1158,6 +1174,8 @@ class CircuitScene(QGraphicsScene):
                 self.network.trafos.pop(uid, None)
             elif kind == "Impedance":
                 self.network.impedances.pop(uid, None)
+            elif kind == "Shunt":
+                self.network.shunts.pop(uid, None)
             self._comp_by_uid.pop(uid, None)
             self.removeItem(item)
         elif isinstance(item, ConnectionItem):
@@ -1165,22 +1183,17 @@ class CircuitScene(QGraphicsScene):
             item.b_comp.unregister_connection(item)
             if item.uid and item.kind == "Line":
                 self.network.lines.pop(item.uid, None)
-            # 母线↔LineComp: 解除 LineComp 的对应字段
-            if item.kind == "Trafo":
-                # 不直接删 trafo, 只清掉它接到的母线 uid(避免变成悬空)
-                comp = item.a_comp if isinstance(item.a_comp, TrafoItem) else item.b_comp
-                bus = item.a_comp if isinstance(item.a_comp, BusItem) else item.b_comp
-                if comp.model.hv_bus == bus.model.uid:
-                    comp.model.hv_bus = ""
-                if comp.model.lv_bus == bus.model.uid:
-                    comp.model.lv_bus = ""
-            elif item.kind == "Impedance":
-                comp = item.a_comp if isinstance(item.a_comp, ImpedanceItem) else item.b_comp
-                bus = item.a_comp if isinstance(item.a_comp, BusItem) else item.b_comp
-                if comp.model.from_bus == bus.model.uid:
-                    comp.model.from_bus = ""
-                if comp.model.to_bus == bus.model.uid:
-                    comp.model.to_bus = ""
+            # 母线↔变压器/阻抗: 少了一侧母线, 整个支路模型不再完整,
+            # 一起删掉 (留空引用会导致 存档载入被拒/撤销快照失效/求解报错)
+            if item.kind in ("Trafo", "Impedance"):
+                comp = item.a_comp
+                if not isinstance(comp, (TrafoItem, ImpedanceItem)):
+                    comp = item.b_comp
+                self.removeItem(item)
+                if item in self._connections:
+                    self._connections.remove(item)
+                self._remove_component(comp.model.uid)
+                return
             self.removeItem(item)
             if item in self._connections:
                 self._connections.remove(item)
@@ -1192,7 +1205,8 @@ class CircuitScene(QGraphicsScene):
         却不参与计算, 保存后凭空消失。
         """
         for d in (self.network.gens, self.network.loads,
-                  self.network.trafos, self.network.impedances):
+                  self.network.trafos, self.network.impedances,
+                  self.network.shunts):
             if comp_uid in d:
                 d.pop(comp_uid)
                 break

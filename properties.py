@@ -70,6 +70,9 @@ class PropertiesPanel(QWidget):
             self._add_float(model, "s_sc_max_mva", "短路容量最大 (MVA)", model.s_sc_max_mva, 1, 100000, 0)
             self._add_float(model, "s_sc_min_mva", "短路容量最小 (MVA)", model.s_sc_min_mva, 1, 100000, 0)
             self._add_float(model, "kappa", "峰值系数 κ", model.kappa, 1.0, 2.0, 2)
+            self._add_note("短路电流(PV 机组)按经验参数估算: "
+                           "S=|P|/0.85(下限10MVA), xdss=18%, 与铭牌无关; "
+                           "PQ 机组按 sgen 电流源参与短路。")
         elif kind == "Load":
             self._add_name_field()
             self._add_combo_bus(model, "bus_uid", "挂接母线", model.bus_uid)
@@ -159,6 +162,13 @@ class PropertiesPanel(QWidget):
         e = QLineEdit(model.name)
         e.editingFinished.connect(lambda: self._set_attr(model, "name", e.text()))
         self.form_layout.addRow("名称", e)
+
+    def _add_note(self, text: str) -> None:
+        """灰色小字说明行(不入 _fields, 不参与编辑)"""
+        l = QLabel(text)
+        l.setWordWrap(True)
+        l.setStyleSheet("color: gray; font-size: 11px;")
+        self.form_layout.addRow(l)
 
     def _clear_form(self) -> None:
         while self.form_layout.count():

@@ -46,23 +46,26 @@ from topo_io import (  # noqa: F401  再导出, 兼容旧导入路径
 from undocmds import SnapshotCommand
 from ux import SearchDialog, make_minimap_dock
 
-__version__ = "0.7.0"
+__version__ = "0.7.1"
 
 
 class PowerFlowThread(QThread):
     """大网络后台计算: 在副本上跑潮流, 完成后把结果交回 GUI 线程"""
     done = pyqtSignal(object, bool, str, float)   # net_copy, ok, err, elapsed_ms
 
-    def __init__(self, net: Network, algorithm: str, parent=None):
+    def __init__(self, net: Network, algorithm: str,
+                 distributed_slack: bool = False, parent=None):
         super().__init__(parent)
         # 深拷贝: 计算期间用户继续编辑不影响输入, 结果也不直接写活网络
         self._net = copy.deepcopy(net)
         self._algorithm = algorithm
+        self._distributed_slack = distributed_slack
 
     def run(self):
         t0 = time.perf_counter()
         try:
-            ok, err = run_power_flow(self._net, algorithm=self._algorithm)
+            ok, err = run_power_flow(self._net, algorithm=self._algorithm,
+                                     distributed_slack=self._distributed_slack)
         except Exception as e:   # 后台线程兜底, 不能让异常无声消失
             ok, err = False, f"{type(e).__name__}: {e}"
         self.done.emit(self._net, ok, err, (time.perf_counter() - t0) * 1000.0)
@@ -646,6 +649,7 @@ class MainWindow(QMainWindow):
         self.status.showMessage("⏳ N-1 校核计算中...", 0)
         QApplication.processEvents()
         report = n_minus_1_check(self.network, algorithm=algorithm,
+                                 distributed_slack=self.act_dslack.isChecked(),
                                  progress=_on_progress)
         if progress is not None:
             progress.setValue(n_branch)
@@ -742,7 +746,9 @@ class MainWindow(QMainWindow):
         if (len(self.network.buses) > self.ASYNC_PF_THRESHOLD
                 and self._pf_thread is None):
             self.status.showMessage("⏳ 正在后台计算潮流...", 0)
-            self._pf_thread = PowerFlowThread(self.network, algorithm, self)
+            self._pf_thread = PowerFlowThread(
+                self.network, algorithm,
+                distributed_slack=self.act_dslack.isChecked(), parent=self)
             self._pf_thread.done.connect(self._on_pf_done)
             self._pf_thread.start()
             return True, ""
@@ -901,6 +907,9 @@ class MainWindow(QMainWindow):
         self._results_ever_shown = False
         if hasattr(self.scene, "_internal_links"):
             self.scene._internal_links.clear()
+        # 剪贴板里的 uid 已全部失效, 留着会被 Ctrl+V 粘成死引用
+        if hasattr(self.scene, "_clipboard"):
+            self.scene._clipboard = None
         # 只移除顶层项: scene.items() 含端口/标签等子项, 父项移除时
         # 子项的 C++ 对象已被一并销毁, 再对子项 removeItem 会访问已释放内存
         for it in list(self.scene.items()):
@@ -986,7 +995,8 @@ class MainWindow(QMainWindow):
         self._refresh_stats()
 
     def _rebuild_scene_from_network(self):
-        from canvas import BusItem, GenItem, LoadItem, TrafoItem, ImpedanceItem, ConnectionItem
+        from canvas import (BusItem, GenItem, LoadItem, TrafoItem,
+                            ImpedanceItem, ShuntItem, ConnectionItem)
         # Components
         for uid, b in self.network.buses.items():
             it = BusItem(b)
@@ -1014,6 +1024,15 @@ class MainWindow(QMainWindow):
             self.scene.addItem(it)
             self.scene._comp_by_uid[uid] = it
             self.scene._register_internal_link(it, l.bus_uid)
+        for uid, sh in self.network.shunts.items():
+            it = ShuntItem(sh)
+            bus = self.network.buses[sh.bus_uid]
+            if sh.x or sh.y:
+                it.setPos(sh.x, sh.y)
+            else:
+                it.setPos(bus.x + 140, bus.y - 80)
+            self.scene.addItem(it)
+            self.scene._comp_by_uid[uid] = it
         for uid, t in self.network.trafos.items():
             it = TrafoItem(t)
             a = self.network.buses[t.hv_bus]

@@ -131,13 +131,20 @@ def test_full_journey_phase2(qapp, tmp_path):
     paths = export_results_csv(w.network, str(tmp_path / "sc"))
     assert "Ikss(kA)" in open(paths["bus"], encoding="utf-8-sig").read()
 
-    # Shunt: 加电容抬高母线电压 (重新潮流)
-    sh = w.scene.add_component("Shunt", 560, 150)
-    sh.model.q_mvar = -20.0
+    # Shunt: 加电容抬高母线电压 (差分对比加前/加后)
     w.act_dc.setChecked(False)
     ok, err = w._run_power_flow()
     assert ok, err
     uid_of = {b.name: u for u, b in w.network.buses.items()}
-    assert "B3" in uid_of
+    b3 = uid_of["B3"]
+    v_without = w.network.bus_voltage_pu[b3]
+    sh = w.scene.add_component("Shunt", 560, 150)
+    sh.model.bus_uid = b3
+    sh.model.q_mvar = -20.0
+    ok, err = w._run_power_flow()
+    assert ok, err
+    v_with = w.network.bus_voltage_pu[b3]
+    assert v_with > v_without, \
+        f"投入 20Mvar 电容后 B3 电压应抬升: {v_without:.4f} -> {v_with:.4f}"
     w._set_dirty(False)
     w.close()

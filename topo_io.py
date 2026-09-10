@@ -5,7 +5,9 @@ parse_topology_json / network_to_json_dict 独立于 GUI, 方便测试与复用�
 app.py 保留同名再导出, 对外接口不变。
 """
 from __future__ import annotations
+import math
 from dataclasses import asdict, fields as dc_fields
+from typing import get_type_hints
 
 from solver import (
     Network, BusNode, GenUnit, LoadUnit,
@@ -21,6 +23,31 @@ _TOPO_SPEC = [
     ("lines", LineBranch), ("trafos", TrafoBranch),
     ("impedances", ImpedanceBranch), ("shunts", ShuntUnit),
 ]
+
+# 不做数值校验的字段: 标识/名称/引用
+_NON_NUMERIC = {"uid", "name", "bus_uid", "from_bus", "to_bus",
+                "hv_bus", "lv_bus", "is_slack", "gen_mode"}
+
+
+def _check_numeric_fields(cls, kwargs, what: str) -> None:
+    """数值字段必须是有限数字, int 字段必须是整数。
+
+    手工编辑的 x="abc"、负长度、NaN 以前会直接进 dataclass,
+    直到界面格式化时才炸; 这里在载入入口拦下并指名道姓。"""
+    hints = get_type_hints(cls)
+    for key, val in kwargs.items():
+        if key in _NON_NUMERIC:
+            continue
+        typ = hints.get(key)
+        if typ is float:
+            if isinstance(val, bool) or not isinstance(val, (int, float)) \
+                    or not math.isfinite(val):
+                raise ValueError(
+                    f"{what} 字段 '{key}' 必须是有限数字, 实际为 {val!r}")
+        elif typ is int:
+            if isinstance(val, bool) or not isinstance(val, int):
+                raise ValueError(
+                    f"{what} 字段 '{key}' 必须是整数, 实际为 {val!r}")
 
 
 def parse_topology_json(data) -> Network:
@@ -44,11 +71,12 @@ def parse_topology_json(data) -> Network:
             if "uid" not in entry or "name" not in entry:
                 raise ValueError(f"'{key}' 条目缺少 uid/name: {entry!r}")
             kwargs = {k: v for k, v in entry.items() if k in allowed}
+            what = f"'{key}' 条目 {entry.get('name', '?')}"
+            _check_numeric_fields(cls, kwargs, what)
             try:
                 obj = cls(**kwargs)
             except TypeError as e:
-                raise ValueError(
-                    f"'{key}' 条目 {entry.get('name', '?')} 字段无效: {e}")
+                raise ValueError(f"{what} 字段无效: {e}")
             getattr(net, key)[obj.uid] = obj
     bus_uids = set(net.buses)
 

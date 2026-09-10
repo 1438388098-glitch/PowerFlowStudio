@@ -260,9 +260,15 @@ def build_pandapower(net: Network, for_opf: bool = False) -> Tuple[pp.pandapower
                     q_mvar=0.0,
                     name=g.name,
                 )
+                # calc_sc 强制要求 sgen 的短路列(sn_mva/k/kappa), 缺了会
+                # 直接 ValueError; 按与 gen 相同的经验近似补齐
+                sn = max(abs(g.p_mw) / 0.85, 10.0)
+                pnet.sgen.at[pp_id, "sn_mva"] = sn
+                pnet.sgen.at[pp_id, "k"] = 1.2
+                pnet.sgen.at[pp_id, "kappa"] = 1.0
                 id_maps.setdefault("sgen", {})[pp_id] = uid
                 continue
-            if for_opf:
+            if for_opf and g.gen_mode != "PQ":
                 pp_id = pp.create_gen(
                     pnet,
                     bus=bus_id_map[g.bus_uid],
@@ -273,6 +279,18 @@ def build_pandapower(net: Network, for_opf: bool = False) -> Tuple[pp.pandapower
                     min_p_mw=g.min_p_mw,
                     max_p_mw=g.max_p_mw,
                 )
+            elif for_opf:
+                # PQ 机组在 OPF 里也不可调度: 定功率注入, 不虚拟成 PV
+                pp_id = pp.create_sgen(
+                    pnet,
+                    bus=bus_id_map[g.bus_uid],
+                    p_mw=g.p_mw,
+                    q_mvar=0.0,
+                    name=g.name,
+                    controllable=False,
+                )
+                id_maps.setdefault("sgen", {})[pp_id] = uid
+                continue
             else:
                 pp_id = pp.create_gen(
                     pnet,
@@ -420,6 +438,9 @@ def _validate_topology(net: Network) -> str:
     for im in net.impedances.values():
         if im.from_bus not in bus_uids or im.to_bus not in bus_uids:
             return f"阻抗 {im.name} 的端点母线不存在(可能已被删除), 请重新连接"
+    for sh in net.shunts.values():
+        if sh.bus_uid not in bus_uids:
+            return f"电容/电抗 {sh.name} 挂接的母线不存在(可能已被删除), 请重新连接"
     return ""
 
 
@@ -479,9 +500,12 @@ def _fail(net: Network, msg: str):
 # ============================================================
 
 def n_minus_1_check(net: Network, algorithm: str = "nr",
-                    loading_limit: float = 100.0, progress=None) -> dict:
+                    loading_limit: float = 100.0, progress=None,
+                    distributed_slack: bool = False) -> dict:
     """
-    N-1 校核: 开断每条线路/变压器后重跑潮流, 报告越限与孤立母线。
+    N-1 校核: 开断每条线路/变压器/串联阻抗后重跑潮流, 报告越限与孤立母线。
+    distributed_slack 与 run_power_flow 同义, 逐条开断的计算沿用同一松弛
+    口径, 避免基线用分布式松弛、开断校核却按单松弛算的结论偏差。
 
     返回 {支路uid: entry}; entry 字段:
       kind/name  被开断支路类型与名称
@@ -493,12 +517,14 @@ def n_minus_1_check(net: Network, algorithm: str = "nr",
     """
     import copy as _copy
     if not net.converged:
-        ok, err = run_power_flow(net, algorithm=algorithm)
+        ok, err = run_power_flow(net, algorithm=algorithm,
+                                 distributed_slack=distributed_slack)
         if not ok:
             return {"_base_failed": err}
 
     branches = [("线路", uid, net.lines) for uid in net.lines]
     branches += [("变压器", uid, net.trafos) for uid in net.trafos]
+    branches += [("阻抗", uid, net.impedances) for uid in net.impedances]
     total = len(branches)
 
     report: Dict[str, dict] = {}
@@ -507,8 +533,11 @@ def n_minus_1_check(net: Network, algorithm: str = "nr",
             progress(done, total)
         name = container[uid].name
         trial = _copy.deepcopy(net)
-        (trial.lines if kind == "线路" else trial.trafos).pop(uid, None)
-        ok, err = run_power_flow(trial, algorithm=algorithm)
+        trial_branches = {"线路": trial.lines, "变压器": trial.trafos,
+                          "阻抗": trial.impedances}[kind]
+        trial_branches.pop(uid, None)
+        ok, err = run_power_flow(trial, algorithm=algorithm,
+                                 distributed_slack=distributed_slack)
         entry = {"kind": kind, "name": name, "ok": ok,
                  "error": "", "overloads": [], "isolated": []}
         if not ok:
@@ -661,7 +690,16 @@ def run_opf(net: Network) -> Tuple[bool, str]:
 
     try:
         pnet, id_maps = build_pandapower(net, for_opf=True)
-        pp.runopp(pnet, verbose=False)
+        # 先跑一次收敛潮流: 结果既可作 OPF 初值(results), 也让用户在
+        # OPF 失败时看到基线潮流状态
+        pp.runpp(pnet, algorithm="nr", init="flat", numba=False)
+        # 初值双保险: 低阻抗并联环网用 flat 实测不收敛, results 更稳;
+        # 但部分简单网络 results 反而发散。两种初值都试, 任一收敛即成
+        try:
+            pp.runopp(pnet, init="results", verbose=False)
+        except pp.OPFNotConverged:
+            pnet, id_maps = build_pandapower(net, for_opf=True)
+            pp.runopp(pnet, init="flat", verbose=False)
     except pp.LoadflowNotConverged as e:
         _fail(net, f"OPF 不收敛: {e}")
         return False, net.error_msg
