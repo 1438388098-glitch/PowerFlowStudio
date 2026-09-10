@@ -4,8 +4,10 @@ Five custom buttons that start a real Qt drag-and-drop when pressed.
 The canvas (CircuitView) accepts drops; this widget does not need to
 coordinate any pending-state with MainWindow.
 """
-from PyQt5.QtCore import Qt, QMimeData, QPoint, QByteArray, QDataStream, QIODevice
-from PyQt5.QtGui import QDrag, QPixmap, QPainter, QColor, QBrush, QPen, QPolygonF, QFont
+import logging
+
+from PyQt5.QtCore import Qt, QMimeData, QPoint, QByteArray
+from PyQt5.QtGui import QDrag, QPixmap
 from PyQt5.QtWidgets import QWidget, QVBoxLayout, QPushButton, QLabel, QSizePolicy
 
 
@@ -55,10 +57,8 @@ class ComponentButton(QPushButton):
                 event.accept()
                 return
             except Exception:
-                import traceback
-                with open("crash.log", "a", encoding="utf-8") as f:
-                    f.write("\n=== palette mousePressEvent exception ===\n")
-                    traceback.print_exc(file=f)
+                logging.getLogger("powerflow.crash").exception(
+                    "palette mousePressEvent exception")
                 # Don't propagate — fall through to default handling.
         super().mousePressEvent(event)
 
@@ -77,6 +77,9 @@ class TrafoButton(ComponentButton):
 
 class ImpedanceButton(ComponentButton):
     KIND = "Impedance"; LABEL = "阻抗  Impedance"; COLOR = "#78783c"
+
+class ShuntButton(ComponentButton):
+    KIND = "Shunt"; LABEL = "电容/电抗  Shunt"; COLOR = "#208080"
 
 
 class ComponentPalette(QWidget):
@@ -97,7 +100,8 @@ class ComponentPalette(QWidget):
         hint.setWordWrap(True)
         layout.addWidget(hint)
 
-        for cls in (BusButton, GenButton, LoadButton, TrafoButton, ImpedanceButton):
+        for cls in (BusButton, GenButton, LoadButton, TrafoButton,
+                    ImpedanceButton, ShuntButton):
             layout.addWidget(cls())
 
         layout.addStretch(1)
