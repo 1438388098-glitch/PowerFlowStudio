@@ -1,6 +1,6 @@
 # 潮流计算 GUI · Power Flow Studio
 
-[![tests](https://github.com/704315792-crypto/PowerFlowStudio/actions/workflows/tests.yml/badge.svg)](https://github.com/704315792-crypto/PowerFlowStudio/actions/workflows/tests.yml)
+[![tests](https://github.com/1438388098-glitch/PowerFlowStudio/actions/workflows/tests.yml/badge.svg)](https://github.com/1438388098-glitch/PowerFlowStudio/actions/workflows/tests.yml)
 
 一个基于 PyQt5 的电力系统潮流计算可视化工具。左侧元件库, 中间画布自由拖拽搭建电网, 右侧编辑参数和查看结果, 内核使用成熟的 pandapower(牛顿-拉夫逊法)。
 
